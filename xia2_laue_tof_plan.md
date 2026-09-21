@@ -28,8 +28,38 @@ orientation** (1359 + 1344 reflections in batches 0 and 1).
 
 **Next, in order:**
 
-1. The scaling tail: `laue_tof_mtz.py`, then pointless and lawless (§ *Step 7/8/9*).
-2. `tests/regression/test_laue_tof.py`, then the docs.
+1. pointless and lawless (§ *Step 8/9*). The unmerged MTZ converter is written.
+2. Integrate everything the geometry allows, not only the observed spots
+   (§ *Resolution: observed, then calculated*).
+3. Finish `tests/regression/test_laue_tof.py` (SXD, the converter unit test),
+   then the docs.
+
+**`laue_tof_mtz.py` is written** (2026-09-21) and wired in as the `unmerged_mtz`
+workflow step, writing `scale/unmerged.mtz` from the combined data with gemmi:
+H, K, L, `M/ISYM` = 1, `BATCH` in dataset 0; `I`/`SIGI`, `LAMBDA`, `ROT`,
+`XDET`/`YDET` in dataset 1; one batch record per orientation with `LDTYPE = 3`,
+the cell, `PHIRANGE = 1`, `BSCALE = 1`, the refined `UMAT` (column-major),
+`SOURCE`/`S0` anti-parallel to the beam and `ALAMBD`/`DELAMB` from that batch's
+wavelength range. `validate_unmerged_mtz` re-reads the file and fails loudly on
+each of the silent failures in the Step 7 table; `check_wavelength_column` is
+there for checking pointless output. Verified on the two-orientation NMX data:
+2703 observations, 2 batches, `ALAMBD` 2.84 Å, `DELAMB` 0.65 Å.
+
+**Both intensities go in one MTZ** (user, 2026-09-21): summation as `I`/`SIGI`
+and profile-fitted as `IPR`/`SIGIPR`, so the file serves either choice and the
+two can be compared after scaling. Consequences, all implemented:
+
+- A reflection whose profile fit failed gets the MTZ missing-number flag in
+  `IPR`/`SIGIPR`, never a zero, so a failed fit cannot be read as a measurement.
+- A poor profile-fit fraction no longer stops later orientations from attempting
+  the fit - it only decides which intensities the SHELX export uses - since the
+  MTZ wants both. Only an outright abort still falls back to summation.
+- The combine step drops `intensity.prf.*` from every table when any orientation
+  lacks it, because tables with different columns cannot be concatenated and an
+  MTZ column cannot cover only some observations. It says which orientation was
+  missing.
+- SHELX HKLF2 holds one intensity by construction, so `output.intensity` still
+  chooses there.
 
 **Integration is a two-axis decision, taken once per run** (2026-09-21):
 
@@ -141,8 +171,12 @@ orientation** (1359 + 1344 reflections in batches 0 and 1).
   2.0 against 370 at 3.0); `radial_profile` finds the most.
   The phil default stays 15, which is what the NMX study chose - say if it
   should change - but the step now **says so**: it reports how much of the spot
-  list the size filter took and, when that is over half and there is room to
-  lower it, suggests `min_spot_size` and `radial_profile`.
+  list the size filter took and, when that is over half, there is room to lower
+  it, and **fewer than 500 spots survive**, suggests `min_spot_size` and
+  `radial_profile`. That last condition matters: thresholding turns up tens of
+  thousands of one and two pixel candidates, so on NMX the filter discards 99%
+  of 187300 and leaves 2296 spots, which is not a problem, where MANDI loses 59%
+  of 558 and is left with 227.
 - **Two bugs in the indexing acceptance test, both found here**:
   1. `min_indexed` was an absolute 250, so every good MANDI solution (147-284
      indexed) was rejected and the orientation counted as "not indexed". It is
@@ -646,6 +680,56 @@ lorentz.applied_by = *integrate | lawless | none
 Whichever is chosen, log the decision explicitly. Expect the overall R-merge to
 move a lot when the correction is on (re-weighting of resolution shells), while
 per-shell values stay put — that is not a loss of quality.
+
+## Resolution: observed now, calculated next
+
+`integration_type=observed` integrates only the spots that were found and
+indexed, which on MANDI is a couple of hundred reflections of the tens of
+thousands the geometry can reach. `integration_type=calculated` integrates every
+predicted reflection out to `calculated.dmin`, and the question is what that
+should be. **Design (user, 2026-09-21: multi-step, starting from the absolute
+d_min of the detector geometry):**
+
+1. **Pass 1, `observed`** as now: index, refine, integrate the found spots. This
+   is what fixes the geometry, and it is cheap.
+2. **Work out where to stop.** The hard floor is geometric -
+   `d = lambda / (2 sin theta)` at the shortest wavelength and the largest
+   scattering angle any pixel sees - and nothing beyond it can have been
+   recorded. `geometric_d_min` computes it and the import step logs it
+   (**implemented 2026-09-21**):
+
+   | | wavelengths | 2theta max | geometric d_min | predicted reflections | observed integrated |
+   |---|---|---|---|---|---|
+   | NMX config1, 50 bins | 1.87-3.54 Å | 134.0° | **1.016 Å** | 93 304 | 1 359 |
+   | MANDI CuZnSOD, 50 bins | 1.92-4.08 Å | 139.3° | **1.027 Å** | 82 630 | ~230 |
+
+   The wavelength range comes from the scan's `time_of_flight` and the flight
+   path, not from `beam.get_wavelength_range()`: FormatESSNMX derives that (and
+   the two agree to three decimals) but **FormatMANDI hard-codes 2.0-4.0 Å**
+   where the histogram gives 1.92-4.08, which alone moves MANDI's limit from
+   1.066 to 1.027 Å. Prediction is cheap - `TOFReflectionPredictor` gives those
+   counts in 1.6 s - so the number can be reported before committing to a pass.
+3. **Pass 2, `calculated`** to that d_min, so that everything measurable is
+   measured. Two to three orders of magnitude more reflections than pass 1, most
+   of them weak, which is the point: the cutoff is a merging decision, not an
+   integration one.
+4. **Cut afterwards on CC½** from lawless, applied at merging. Re-running lawless
+   with `RESOLUTION` costs nothing, where re-integrating costs everything, so the
+   pipeline integrates wide once and cuts as often as it likes.
+
+Open points for the implementation:
+
+- Phil shape: `integration.expand = True/False` plus
+  `integration.expand_d_min = *geometric observed <float>`, or fold it into
+  `integration_type` with the d_min derived when it is `calculated`.
+- A cost guard (`integration.max_predicted`): 93 000 shoeboxes is a different
+  proposition from 1 359, and a large cell with an optimistic d_min could run for
+  hours. Predict first, log the count, refuse above the guard.
+- `integration.wavelength_range` should default to the TOF-derived band, so that
+  predictions outside what was recorded are dropped rather than integrated as
+  noise - particularly on MANDI, where the stated band is not the measured one.
+- Whether to keep the pass 1 output as a checkpoint (it is a strict subset) or
+  overwrite it.
 
 ## Files to add / modify
 

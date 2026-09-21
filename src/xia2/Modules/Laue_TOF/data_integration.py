@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import pathlib
 import shutil
@@ -40,6 +41,10 @@ KNOWN_ORIENTATION = "known_orientation"
 
 # Foreground/background mask methods, as named by dials.tof_integrate
 MASKS = ("ellipse", "seed_skewness")
+
+# Below this many strong spots, what the spot size filter discarded is worth
+# querying: a few hundred spots is enough to index but leaves nothing spare.
+FEW_SPOTS = 500
 
 
 @dataclass
@@ -181,6 +186,73 @@ def bin_run(
     if not output_file.is_file():
         raise ValueError(f"{name} did not write the expected output {output_file}")
     return output_file
+
+
+# Neutron wavelength from time of flight: lambda[A] = H_OVER_M * t[s] / L[m]
+H_OVER_M = 3956.034
+
+
+def wavelength_range(experiment) -> tuple[float, float]:
+    """
+    The wavelength range of an experiment, in Angstrom, from its TOF range.
+
+    Derived from the scan rather than taken from beam.get_wavelength_range(),
+    because a format class may state a fixed band instead of the one the data
+    holds: FormatESSNMX derives it (and the two agree to three decimals) while
+    FormatMANDI returns a hard-coded 2.0-4.0 where the histogram gives
+    1.92-4.08. Falls back to the beam if the scan has no time_of_flight.
+    """
+    scan = experiment.scan
+    if scan is None or not scan.has_property("time_of_flight"):
+        return tuple(experiment.beam.get_wavelength_range())  # type: ignore[return-value]
+    tof = scan.get_property("time_of_flight")  # microseconds
+    t_min, t_max = min(tof) * 1e-6, max(tof) * 1e-6
+    to_source = experiment.beam.get_sample_to_source_distance() / 1000.0  # m
+    distances = [panel.get_distance() / 1000.0 for panel in experiment.detector]
+    longest = to_source + max(distances)
+    shortest = to_source + min(distances)
+    return H_OVER_M * t_min / longest, H_OVER_M * t_max / shortest
+
+
+def geometric_d_min(experiment) -> tuple[float, float]:
+    """
+    The best resolution the detector and the wavelength band can reach, and the
+    largest scattering angle, in Angstrom and degrees.
+
+    d = lambda / (2 sin theta), so the limit is the shortest wavelength at the
+    largest scattering angle any pixel sees. It is a property of the instrument
+    and the binning, not of the crystal or of what was observed, which makes it
+    the sensible place to stop when integrating every predicted reflection
+    rather than only the spots that were found.
+    """
+    lambda_min, _ = wavelength_range(experiment)
+    to_source = experiment.beam.get_sample_to_source_distance() / 1000.0
+    unit_s0 = experiment.beam.get_unit_s0()
+    best_d_min = None
+    widest = 0.0
+    for panel in experiment.detector:
+        nx, ny = panel.get_image_size()
+        corners = ((0, 0), (nx, 0), (0, ny), (nx, ny), (nx / 2, ny / 2))
+        two_theta = max(
+            panel.get_two_theta_at_pixel(unit_s0, corner) for corner in corners
+        )
+        if two_theta <= 0:
+            continue
+        # This panel's own flight path sets its shortest wavelength
+        panel_lambda_min = lambda_min
+        if experiment.scan is not None and experiment.scan.has_property(
+            "time_of_flight"
+        ):
+            t_min = min(experiment.scan.get_property("time_of_flight")) * 1e-6
+            panel_lambda_min = (
+                H_OVER_M * t_min / (to_source + panel.get_distance() / 1000.0)
+            )
+        d_min = panel_lambda_min / (2 * math.sin(two_theta / 2))
+        best_d_min = d_min if best_d_min is None else min(best_d_min, d_min)
+        widest = max(widest, two_theta)
+    if best_d_min is None:
+        raise ValueError("No panel of this detector sees a non-zero scattering angle")
+    return best_d_min, math.degrees(widest)
 
 
 def _format_class_name(image: str) -> str:
@@ -370,18 +442,31 @@ def run_import(
         f"Imported {len(expts)} experiment(s) with {_format_class_name(image)},"
         f" {len(expts[0].detector)} panels, {expts[0].scan.get_num_images()} TOF bins"
     )
+    low, high = wavelength_range(expts[0])
+    d_min, two_theta = geometric_d_min(expts[0])
+    xia2_logger.info(
+        f"Wavelengths {low:.2f}-{high:.2f} A over scattering angles up to"
+        f" {two_theta:.0f} deg, so the geometry allows d_min = {d_min:.3f} A"
+    )
     return experiments
 
 
-def _report_size_filter(logfile: pathlib.Path, params: SpotfindingParams) -> None:
+def _report_size_filter(
+    logfile: pathlib.Path, params: SpotfindingParams, n_strong: int
+) -> None:
     """
-    Say how much of the spot list the minimum spot size took, when it is a lot.
+    Say how much of the spot list the minimum spot size took.
 
     min_spot_size is the parameter most worth revisiting on a new instrument:
     the default suits NMX, where small split peaks are the problem, but on data
     whose spots span few TOF frames it can discard most of what was found. The
     counts are in the dials.find_spots log, which reports what it extracted
     before filtering.
+
+    Advice is only worth giving when the spots that survive are few: a
+    thresholding pass turns up tens of thousands of one and two pixel
+    candidates, so on NMX 99% of them are filtered out and 2296 spots remain,
+    which is not a problem. On MANDI it is 59% of 558, leaving 227.
     """
     if not logfile.is_file():
         return
@@ -398,7 +483,7 @@ def _report_size_filter(logfile: pathlib.Path, params: SpotfindingParams) -> Non
         f"{removed} of {extracted} spots found were smaller than"
         f" spotfinding.min_spot_size ({params.min_spot_size} pixels)"
     )
-    if fraction >= 0.5 and params.min_spot_size > 3:
+    if fraction >= 0.5 and params.min_spot_size > 3 and n_strong < FEW_SPOTS:
         # Nothing to suggest once the size filter is down to a few pixels: a
         # threshold algorithm like radial_profile finds tens of thousands of
         # one and two pixel candidates by design, and dropping those is the
@@ -442,7 +527,7 @@ def find_spots(working_directory: pathlib.Path, params: SpotfindingParams) -> in
     strong = flex.reflection_table.from_file(working_directory / "strong.refl")
     n_strong = strong.size()
     xia2_logger.info(f"Found {n_strong} strong spots")
-    _report_size_filter(working_directory / "dials.find_spots.log", params)
+    _report_size_filter(working_directory / "dials.find_spots.log", params, n_strong)
     if n_strong > params.max_strong:
         raise ValueError(
             f"{n_strong} strong spots found, more than spotfinding.max_strong"
@@ -799,17 +884,18 @@ def _run_tof_integrate(
     if method != "summation":
         fraction = _profile_fraction(integrated)
         if fraction < params.min_profile_fraction:
-            # The summation intensities in this file are still good, so there
-            # is nothing to rerun - but say so, and stop paying for a profile
-            # fit that is not delivering on the orientations still to come.
+            # Nothing to rerun: the summation intensities in this file are good
+            # and the profile ones are kept as they are, so that both reach the
+            # unmerged MTZ. What changes is which of them is exported as the
+            # single SHELX intensity.
             xia2_logger.warning(
                 f"{method} fitted only {fraction:.1%} of the reflections, fewer"
                 f" than integration.min_profile_fraction"
                 f" ({params.min_profile_fraction:.0%}), so the summation"
-                " intensities will be used"
+                " intensities will be the ones used"
             )
-            return "summation", integrated
-        xia2_logger.info(f"{method} fitted {fraction:.1%} of the reflections")
+        else:
+            xia2_logger.info(f"{method} fitted {fraction:.1%} of the reflections")
     return method, integrated
 
 
@@ -922,6 +1008,7 @@ def combine(
         tables.extend(split)
         origins.extend([result.name] * len(split))
     experiments, tables = assign_unique_identifiers(experiments, tables)
+    _match_intensity_columns(tables, origins)
 
     # dials.export numbers the Laue batches by imageset_id, which is zero in
     # every per-orientation file. Renumber it to the position of the experiment
@@ -969,6 +1056,41 @@ def _intensity_choice(reflections: pathlib.Path, params: ExportParams) -> str:
             " reflections, so the summation intensities are exported"
         )
     return "sum"
+
+
+def _match_intensity_columns(
+    tables: list[flex.reflection_table], origins: list[str]
+) -> None:
+    """
+    Make every table carry the same intensity columns, so they can be combined.
+
+    A profile method that aborted on one orientation and worked on another
+    leaves tables that cannot be concatenated, and an MTZ cannot hold a column
+    for only some of its observations. The profile-fitted intensities are the
+    ones that go, since summation is always there.
+    """
+    with_profile = [
+        origin
+        for table, origin in zip(tables, origins)
+        if "intensity.prf.value" in table
+    ]
+    if not with_profile or len(with_profile) == len(tables):
+        return
+    missing = [
+        origin
+        for table, origin in zip(tables, origins)
+        if "intensity.prf.value" not in table
+    ]
+    xia2_logger.warning(
+        f"{', '.join(missing)} {'has' if len(missing) == 1 else 'have'} no"
+        " profile-fitted intensities, so they are dropped from"
+        f" {', '.join(with_profile)} too and only summation intensities are"
+        " combined."
+    )
+    for table in tables:
+        for column in ("intensity.prf.value", "intensity.prf.variance"):
+            if column in table:
+                del table[column]
 
 
 def _report_lorentz(table: flex.reflection_table) -> None:
@@ -1036,6 +1158,27 @@ def export_shelx(
     if ins.is_file():
         FileHandler.record_data_file(str(ins))
     return hklout
+
+
+def unmerged_mtz(
+    working_directory: pathlib.Path,
+    experiments_file: pathlib.Path,
+    reflections_file: pathlib.Path,
+) -> pathlib.Path:
+    """
+    Write the combined data as an unmerged Laue MTZ, for pointless and lawless.
+
+    dials.export cannot do this - format=mtz is refused for time-of-flight data
+    - so xia2 writes the file itself.
+    """
+    from xia2.Modules.Laue_TOF.laue_tof_mtz import write_unmerged_mtz
+
+    xia2_logger.notice(banner("Writing the unmerged MTZ"))  # type: ignore
+    mtz_file = write_unmerged_mtz(
+        experiments_file, reflections_file, working_directory / "unmerged.mtz"
+    )
+    FileHandler.record_data_file(str(mtz_file))
+    return mtz_file
 
 
 def _prepare_images(
@@ -1275,7 +1418,9 @@ def run_data_integration(
         return results
 
     scale_directory = root_working_directory / "scale"
-    combine(scale_directory, results)
+    experiments_file, reflections_file = combine(scale_directory, results)
     if "export" in setup.options.steps:
         export_shelx(scale_directory, setup.export_params)
+    if "unmerged_mtz" in setup.options.steps:
+        unmerged_mtz(scale_directory, experiments_file, reflections_file)
     return results

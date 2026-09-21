@@ -17,6 +17,10 @@ __pycache__/
 # VS code
 .vscode
 
+# Local python environment (DIALS-linked venv)
+/.venv
+/.env
+
 # Python packaging
 /build
 /dist

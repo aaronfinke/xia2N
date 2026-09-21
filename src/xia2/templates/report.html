@@ -100,6 +100,7 @@
         {{ macros.panel('Analysis by resolution', 'resolution', resolution_graphs) }}
         {{ macros.panel('Analysis by batch', 'batch', batch_graphs) }}
         {{ macros.panel('Miscellaneous', 'misc', misc_graphs, styles=styles) }}
+        {% block extra_panels %}{% endblock %}
     </div>
 
 </div>

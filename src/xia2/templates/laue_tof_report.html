@@ -1,0 +1,6 @@
+{% extends "report.html" %}
+
+{% block extra_panels %}
+    {{ macros.panel('Laue wavelength normalisation', 'laue', laue_graphs,
+                    tables=laue_tables, show=True) }}
+{% endblock %}

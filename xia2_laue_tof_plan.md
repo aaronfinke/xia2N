@@ -28,12 +28,9 @@ orientation** (1359 + 1344 reflections in batches 0 and 1).
 
 **Next, in order:**
 
-1. The output report (§ *The output report*): reuse `xia2.Modules.Report` on
-   lawless's `scaled_unmerged.mtz`, plus a Laue section for the wavelength
-   normalisation.
-2. Integrate everything the geometry allows, not only the observed spots
+1. Integrate everything the geometry allows, not only the observed spots
    (§ *Resolution: observed, then calculated*).
-3. Finish `tests/regression/test_laue_tof.py` (SXD, the converter unit test),
+2. Finish `tests/regression/test_laue_tof.py` (SXD, the converter unit test),
    then the docs.
 
 **The scaling tail is written** (2026-09-21): `laue_tof_scale.py`, wired in as
@@ -715,8 +712,9 @@ per-shell values stay put — that is not a loss of quality.
 
 ## The output report
 
-xia2 already has this, and the Laue-TOF pipeline should use the same thing
-rather than grow its own: `xia2.Modules.Report.Report` +
+**Written 2026-09-21** as `laue_tof_report.py` and the `report` workflow step,
+producing `xia2.laue_tof-report.html` and `-report.json` in the run directory.
+It is xia2's own report page with one panel added, not a new kind of report: `xia2.Modules.Report.Report` +
 `src/xia2/templates/report.html`, driven as `xia2.cli.report` drives it -
 `Report.from_unmerged_mtz(mtz, params, report_dir)`, then
 `resolution_plots_and_stats()`, `batch_dependent_plots()`,
@@ -727,25 +725,31 @@ tables and plots they already know: CC½ and I/sigma against resolution,
 completeness, multiplicity, Rmerge against batch, second moments, the L test,
 Wilson plot and the multiplicity images.
 
-Fit for this pipeline:
+How it works out:
 
-- **Input**: `Report.from_unmerged_mtz` wants an unmerged MTZ with `BATCH` and
-  `I`/`SIGI`, which is exactly what lawless writes as
-  `scaled_unmerged.mtz` - so the report goes at the end of the scaling tail, on
-  the scaled data, and one batch per orientation makes the batch plots a
-  per-setting summary. It also reads `SCALEUSED` when present, which lawless
-  writes; nothing must apply it a second time.
-- **Call it in process**, as `xia2.cli.report.run` does, rather than shelling
-  out, so that the report lands in the run directory and is registered with
-  `FileHandler.record_html_file` like every other xia2 html output.
-- **What it will not show** is the Laue-specific part: the wavelength
-  normalisation curve, the per-batch wavelength band, and `I`/`SIGI` against
-  `IPR`/`SIGIPR`. lawless writes `LAMBDANORM` and `NORMPLOT` for the first of
-  those, and its XML carries the fitted parameters
-  (`WavelengthNormalisationGPR`: reference wavelength, range, kernel, length
-  scale, training bins), so the pipeline should add one section of its own to
-  the same page instead of a separate report.
-- `prefix` should be `xia2.laue_tof`, giving `xia2.laue_tof-report.html`.
+- **Input** is lawless's `scaled_unmerged.mtz`, which `Report.from_unmerged_mtz`
+  reads unchanged: it has `BATCH`, `I`/`SIGI` and `SCALEUSED` (already applied -
+  nothing may apply it again). One batch per orientation makes the batch plots a
+  per-setting summary. Verified on the NMX pair: 11 overall rows, 21 merging
+  rows, and the cc_one_half / i_over_sig_i / completeness /
+  multiplicity_vs_resolution / r_pim plots all come back.
+- **Called in process**, as `xia2.cli.report.run` does, so the page lands in the
+  run directory and is registered with `FileHandler.record_html_file`.
+- **The Laue panel** ("Laue wavelength normalisation", open by default) holds
+  what the standard page cannot know: the fitted `w(lambda)` curve with its
+  1-sigma band and the binned observations it was fitted to, read from lawless's
+  `LAMBDANORM` (a gnuplot script whose numbers sit in `$LAMBDANORM` and
+  `$LAMBDABINS` inline blocks); the wavelength band each orientation
+  contributed, from `ALAMBD`/`DELAMB` in the MTZ batch headers; profile-fitted
+  against summation intensities, taken from the **unscaled** `unmerged.mtz`,
+  since that is the only file carrying both; and a table of what lawless fitted,
+  from the XML.
+- **The template hook**: `src/xia2/templates/report.html` gained an empty
+  `{% block extra_panels %}`, and `laue_tof_report.html` extends it to fill that
+  block. One line upstream, no duplicated template, and any other pipeline can
+  use the same hook.
+- A failure writing the report is reported and does not fail the run: everything
+  it describes is already on disk.
 
 ## Resolution: observed now, calculated next
 

@@ -1450,5 +1450,6 @@ def run_data_integration(
             setup.lawless_params,
             _lorentz_applied(reflections_file),
             setup.options.steps,
+            report_directory=root_working_directory,
         )
     return results

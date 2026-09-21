@@ -506,7 +506,7 @@ scaling {
 workflow_phil_str = """
 workflow {
   steps = *bin *find_spots *index *refine *integrate *combine *export \
-          *unmerged_mtz *pointless *lawless
+          *unmerged_mtz *pointless *lawless *report
     .type = choice(multi=True)
     .help = "Option to turn off particular steps. Multiple choices should be of"
             "the format steps=find_spots+index"

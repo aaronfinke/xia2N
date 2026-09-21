@@ -383,7 +383,7 @@ def run_lawless(
     return hklout
 
 
-def _lawless_xml(xmlout: pathlib.Path) -> ElementTree.Element | None:
+def lawless_xml(xmlout: pathlib.Path) -> ElementTree.Element | None:
     """
     The root of a lawless XML file, repaired if need be.
 
@@ -440,7 +440,7 @@ def _report_lawless(xmlout: pathlib.Path) -> None:
             f"lawless wrote no {xmlout.name}, so it reported no statistics"
         )
         return
-    root = _lawless_xml(xmlout)
+    root = lawless_xml(xmlout)
     if root is None:
         return
 
@@ -487,6 +487,40 @@ def _report_lawless(xmlout: pathlib.Path) -> None:
             )
 
 
+def _report(
+    working_directory: pathlib.Path,
+    scaled: pathlib.Path,
+    unmerged_mtz: pathlib.Path,
+) -> None:
+    """
+    Write the run report from the scaled data.
+
+    The report is the last thing a run produces and the least important thing to
+    get in the way, so a failure in it is reported and does not take the run
+    with it - the data it describes is already written.
+    """
+    from xia2.Modules.Laue_TOF.laue_tof_report import generate_report
+
+    # lawless writes the unmerged companion beside the merged output
+    scaled_unmerged = scaled.with_name(f"{scaled.stem}_unmerged.mtz")
+    if not scaled_unmerged.is_file():
+        xia2_logger.warning(
+            f"lawless wrote no {scaled_unmerged.name}, so there is nothing"
+            " unmerged to report on. Add OUTPUT UNMERGED to"
+            " scaling.lawless.keywords."
+        )
+        return
+    try:
+        generate_report(
+            working_directory,
+            scaled_unmerged,
+            unmerged_mtz=unmerged_mtz,
+            lawless_directory=scaled.parent,
+        )
+    except Exception as e:
+        xia2_logger.warning(f"Unable to write the report: {e}")
+
+
 def scale(
     working_directory: pathlib.Path,
     unmerged_mtz: pathlib.Path,
@@ -494,6 +528,7 @@ def scale(
     lawless_params: LawlessParams,
     lorentz_applied: bool,
     steps: list[str],
+    report_directory: pathlib.Path | None = None,
 ) -> pathlib.Path | None:
     """
     Run the scaling tail, as far as the steps and the programs available allow.
@@ -509,12 +544,17 @@ def scale(
             )
         if "lawless" not in steps:
             return sorted_mtz if sorted_mtz != unmerged_mtz else None
-        return run_lawless(
+        scaled = run_lawless(
             working_directory / "scaled",
             sorted_mtz,
             lawless_params,
             lorentz_applied,
         )
+        if "report" in steps:
+            # The report belongs where the user will look for it, which is the
+            # run directory rather than the scaling one
+            _report(report_directory or working_directory, scaled, unmerged_mtz)
+        return scaled
     except FileNotFoundError as e:
         xia2_logger.warning(
             f"{e} The unmerged data is in {unmerged_mtz}, so the scaling can be"

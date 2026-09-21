@@ -7,25 +7,93 @@
 | file | what it is |
 |---|---|
 | `src/xia2/Modules/Laue_TOF/laue_tof.py` | phil scope, the `*Params` dataclasses with `from_phil`, `classify_input`, `setup_from_phil`, `run_xia2_laue_tof` |
-| `src/xia2/Modules/Laue_TOF/data_integration.py` | the step functions: `bin_run`, `run_import`, `find_spots`, `index`, `refine`, `integrate`, `process_exposure`, `run_data_integration` |
+| `src/xia2/Modules/Laue_TOF/data_integration.py` | the step functions: `bin_run`, `run_import`, `find_spots`, `index`, `refine`, `integrate`, `combine`, `export_shelx`, `process_exposure`, `run_data_integration` |
 | `src/xia2/Modules/Laue_TOF/util.py` | `report_timing` (copied, not imported from SSX — nothing here may depend on `xia2.Modules.SSX`) |
+| `src/xia2/cli/laue_tof.py` | the `xia2.laue_tof` command: `ArgumentParser` / `setup_logging` / `cleanup` / `write_citations`, mirroring `cli/ssx.py`. Registered in `setup.py` as `xia2.laue_tof=xia2.cli.laue_tof:run` |
 
-Verified end to end on `ppase_allconfigs/config1/config1_scipp_output_50bins.h5`:
-2296 strong spots → `fft3d` 1927/2296 indexed (83.9 %), RMSD 1.52 px → refined cell
+Verified end to end **from the shell** on
+`ppase_allconfigs/config1/config1_scipp_output_50bins.h5`: 2296 strong spots →
+`fft3d` 1927/2296 indexed (83.9 %), RMSD 1.52 px → refined cell
 `(105.9, 95.69, 113.94, 90, 98.06, 90) C 1 2 1` → 1359 integrated reflections
 carrying `wavelength_cal` over 2.23–3.54 Å, with `Adding Lorentz correction` in
-the integration log. Seeded indexing gives `1923/2296 (83.8 %)` and returns the
-correct centred cell.
+the integration log; 35 s for the run. Seeded indexing gives `1925/2296 (83.8 %)`
+and returns the correct centred cell.
+
+Also verified at **N=2** (the same file linked under two names, so two
+orientations of identical data): orientation_1 indexes de novo, orientation_2 is
+seeded (`known_orientation`), and the combine/export step writes
+`scale/combined.{expt,refl}` with 2 experiments, 2 imagesets, unique identifiers
+and 2703 reflections, then `scale/dials.hkl` with **one SHELX batch per
+orientation** (1359 + 1344 reflections in batches 0 and 1).
 
 **Next, in order:**
 
-1. `src/xia2/cli/laue_tof.py` — the `ArgumentParser` / `setup_logging` / `cleanup`
-   wrapper, mirroring `src/xia2/cli/ssx.py`, plus the
-   `"xia2.laue_tof=xia2.cli.laue_tof:run"` console script in `setup.py`. Until
-   this exists the pipeline can only be driven from Python, not the shell.
-2. The combine + export step across orientations (§ *Files to add / modify*, item 4).
-3. The scaling tail: `laue_tof_mtz.py`, then pointless and lawless (§ *Step 7/8/9*).
-4. `tests/regression/test_laue_tof.py`, then the docs.
+1. The scaling tail: `laue_tof_mtz.py`, then pointless and lawless (§ *Step 7/8/9*).
+2. `tests/regression/test_laue_tof.py`, then the docs.
+
+**Integration is a two-axis decision, taken once per run** (2026-09-21):
+
+- `dials.tof_integrate` always writes `intensity.sum.*`; a profile method adds
+  `intensity.prf.*` **alongside** it. So a profile run that works gives both, and
+  "fall back to summation" is only needed for an outright failure.
+- Outright failure is real: `method=profile_1d_ibix` **aborts** on the NMX test
+  data (both masks, exit 134) with
+  `DIALS_ASSERT(A >= min_bounds[0] && A <= max_bounds[0])` at
+  `tof_profile_1d_ibix.h:246`. `A` is hard-coded to 1.0 and `min_bounds[0]` is
+  1.0, so the assert can only fail through `max_bounds[0] = 1e4 * intensity_max`
+  being NaN — i.e. a shoebox with non-finite intensities. It kills the whole
+  run, not one reflection, and the message names no reflection. **Second DIALS
+  bug report candidate.** `integration.method` therefore defaults to
+  `profile_1d_ibix` with `fallback_method=summation`, and the fallback is
+  remembered for the remaining orientations instead of failing on each.
+- A profile run finishing is **not** the method working: `profile_3d_gutmann`
+  completed on the same data but fitted **13 of 1359** reflections (~4 min,
+  against 7 s for summation), leaving an `intensity.prf` column covering 1 % of
+  the data. So `integration.min_profile_fraction` (default 0.5) is checked
+  after every successful profile run: below it, the summation intensities are
+  used, the remaining orientations skip the profile fit, and
+  `output.intensity=auto` exports `sum`. (Gutmann is not a priority - user,
+  2026-09-21 - it is kept only as a phil choice.)
+- The two foreground masks give **different data, not different quality
+  metrics of the same data** (summation, Lorentz on, `nproc=8`, one NMX
+  orientation):
+
+  | mask | wall | CPU | integrated | mean I/σ | median I/σ | mean foreground px | mean I |
+  |---|---|---|---|---|---|---|---|
+  | `ellipse` | 7.0 s | 4.5 s | 1359 | 36.5 | 29.8 | 71.6 | 1.49e-3 |
+  | `seed_skewness` | 26.5 s | 144 s | 1359 | 59.6 | 46.2 | 322.2 | 3.85e-3 |
+
+  CC between the two sets of intensities is 0.95; `seed_skewness` takes in ~4.5×
+  the foreground and 2.6× the intensity. Higher I/σ is **not** proof it is
+  better — only merging statistics after lawless can settle that, so
+  `mask=both` integrates each way on the **first** orientation, logs the
+  comparison, keeps the winner by `mask_metric`, and **reuses that mask for
+  every other orientation** so all batches are integrated alike.
+- `dials.export format=shelx` refuses its own `intensity=auto` when both
+  columns are present (*"Only 1 intensity option can be exported in this
+  format"*), so the export step always passes an explicit `intensity=`, chosen
+  from `output.intensity` (auto → profile when `intensity.prf.value` exists).
+
+**Notes carried out of the combine step:**
+
+- `dials.export` takes the Laue batch number straight from `imageset_id`, which
+  is 0 in every per-orientation file, so `combine` renumbers it to the position
+  of the experiment in the combined list (which is also where its imageset now
+  sits). Without that every orientation exports as batch 0 — one of the silent
+  failures listed in Risks. Batches are therefore **0-based** in the SHELX file;
+  the unmerged-MTZ converter must emit **1-based** batch numbers for MTZ/pointless.
+- `dials.tof_integrate` leaves **no record of the Lorentz correction** in its
+  output: with `corrections.lorentz=True` it multiplies the intensities and
+  variances by `L` in the C++ integrator and writes no column and no flag, so
+  only the line *"Adding Lorentz correction"* in its log says it happened. The
+  integrate step therefore stamps a `lorentz_applied` boolean column on
+  `integrated.refl`; it survives the combine (concat) and `dials.export`, the
+  combine step logs what it says, and orientations that disagree are rejected
+  rather than scaled together. The MTZ converter should carry it into the file
+  as well, and it is what drives the lawless `LORENTZ` keyword.
+- Identical `image=` values are **deduplicated by phil**, and `FileInput.resolve_paths`
+  resolves symlinks, so two links to one file end up as one input path (but still
+  two entries, hence two orientations). Worth knowing when constructing tests.
 
 **Not started**: everything in *Wavelength normalisation and scaling*, which was
 deliberately deferred — the module deals only with binning and the DIALS steps.
@@ -450,6 +518,16 @@ HKLF2 checkpoint written by `dials.export format=shelx`.
 
 ### Lorentz: exactly once
 
+**DIALS records nothing about it.** `corrections.lorentz=True` multiplies `I`,
+`B` and their variances by `L = sin²θ/λ⁴` inside the C++ integrator
+(`tof_integration.h`) and writes no column and no flag; the only trace is
+*"Adding Lorentz correction"* in `tof_integrate.log`. An `integrated.refl` from
+someone else therefore cannot be asked whether it is corrected. xia2 adds a
+`lorentz_applied` boolean column at the integrate step so the answer travels
+with the data through combine and into the MTZ, and refuses to combine
+orientations that disagree.
+
+
 `dials.tof_integrate corrections.lorentz` defaults to **False**; lawless `LORENTZ`
 defaults to **NONE** and *nothing infers it* — not even `PROBE NEUTRON`. So by
 default the Laue Lorentz factor is applied **nowhere**, and applying it twice is as
@@ -508,8 +586,14 @@ orientation is one experiment, not thousands of stills).
               strategy=None                # drop-in index.phil, wins over all above
               phil=None }
    bravais_settings { enabled=True phil=None }
-   integration { method=summation integration_type=observed
-                 background_model=linear3d mask=ellipse lorentz=True
+   integration { method=profile_1d_ibix   # summation is written whatever is set
+                 fallback_method=summation  # profile fitting can abort the run
+                 min_profile_fraction=0.5   # or fit almost nothing and "succeed"
+                 integration_type=observed
+                 background_model=linear3d
+                 mask=both                  # ellipse | seed_skewness | both
+                 mask_metric=i_over_sigma   # how both is decided
+                 lorentz=True
                  bbox_tof_padding= bbox_xy_padding= wavelength_range=
                  absorption{…} phil=None }
    absorption { … passthrough / corrections.absorption overrides (default off) }
@@ -540,7 +624,7 @@ orientation is one experiment, not thousands of stills).
        keywords = None            # extra raw keyword lines appended
      }
    }
-   output  { shelx=True mtz=True }
+   output  { shelx=True mtz=True intensity=auto composition=CH }
    workflow.steps = find_spots+index+bravais+refine+integrate+combine+export+
                     unmerged_mtz+pointless+lawless
    nproc=<auto>
@@ -754,8 +838,14 @@ Everything runs from `.venv/` in this repo (gitignored), built from the DIALS
 conda python with `--system-site-packages`:
 
 ```
-source .venv/bin/activate      # also puts the DIALS dispatchers on $PATH
+source .venv/bin/activate
+export PATH=/Users/aaronfinke/dials/dials-v3-30-0/conda_base/bin:$PATH
 ```
+
+The second line matters: `.venv/bin` holds the `xia2.*` scripts but **not** the
+DIALS dispatchers, and the steps shell out to `dials.import` etc., so without the
+conda `bin` on `$PATH` the first step fails with *"Unable to find dials.import on
+$PATH"*.
 
 | what | where |
 |---|---|

@@ -18,6 +18,7 @@ console_scripts = [
     "dev.xia2.make_sphinx_html=xia2.cli.make_sphinx_html:run",
     "dev.xia2.show_mask=xia2.cli.show_mask:run",
     "dev.xia2.show_mtz_cells=xia2.cli.show_mtz_cells:run",
+    "xia2.laue_tof=xia2.cli.laue_tof:run",
     "xia2.ssx=xia2.cli.ssx:run",
     "xia2.ssx_reduce=xia2.cli.ssx_reduce:run",
     "xia2.add_free_set=xia2.cli.add_free_set:run",

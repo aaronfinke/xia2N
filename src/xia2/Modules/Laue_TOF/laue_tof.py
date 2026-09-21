@@ -247,9 +247,29 @@ indexing {
 
 integration_phil_str = """
 integration {
-  method = *summation profile_1d_ibix profile_3d_gutmann
+  method = summation *profile_1d_ibix profile_3d_gutmann
     .type = choice
+    .help = "Integration method. Summation intensities are written whichever"
+            "method is chosen; a profile method adds intensity.prf alongside"
+            "them. Profile fitting is not robust on all data - it can abort the"
+            "whole run on a bad shoebox - so see fallback_method."
     .expert_level = 1
+  fallback_method = *summation none
+    .type = choice
+    .help = "What to run when a profile method fails outright. The failure and"
+            "the fallback are logged, and the fallback is then used for the"
+            "remaining orientations rather than failing again on each."
+    .expert_level = 2
+  min_profile_fraction = 0.5
+    .type = float(value_min=0, value_max=1)
+    .help = "The fraction of reflections a profile method has to fit for its"
+            "intensities to be usable. A profile run can finish successfully"
+            "having fitted almost nothing - profile_3d_gutmann fitted 13 of"
+            "1359 reflections on NMX test data - which is worse than useless,"
+            "because the profile column then exists but covers a handful of"
+            "reflections. Below this fraction the summation intensities are"
+            "used instead and the remaining orientations skip the profile fit."
+    .expert_level = 2
   integration_type = *observed calculated
     .type = choice
     .help = "observed integrates only reflections observed during spotfinding,"
@@ -262,10 +282,23 @@ integration {
   background_model = constant2d constant3d linear2d *linear3d
     .type = choice
     .expert_level = 2
-  mask = *ellipse seed_skewness
+  mask = ellipse seed_skewness *both
     .type = choice
-    .help = "Foreground/background mask method."
+    .help = "Foreground/background mask method. both integrates twice, once"
+            "with each mask, and keeps the better of the two (see"
+            "mask_metric). The masks partition the shoebox differently, so"
+            "which one is better is data dependent: seed_skewness typically"
+            "takes in more of the peak tails and gives higher I/sigma, at"
+            "several times the run time. The choice made on the first"
+            "orientation is reused for the rest, so that every batch is"
+            "integrated the same way."
     .expert_level = 2
+  mask_metric = *i_over_sigma n_integrated
+    .type = choice
+    .help = "How to choose between the two masks when mask=both. Neither is a"
+            "substitute for merging statistics, which are only available after"
+            "scaling: treat the choice as a starting point and check it there."
+    .expert_level = 3
   ellipse_mask_scale = 1.0
     .type = float(value_min=0.5)
     .expert_level = 3
@@ -318,9 +351,33 @@ integration {
 }
 """
 
+output_phil_str = """
+output {
+  intensity = *auto sum profile
+    .type = choice
+    .help = "Which intensities to export. auto uses the profile-fitted"
+            "intensities when they are present and cover at least"
+            "integration.min_profile_fraction of the reflections, and the"
+            "summation intensities otherwise. dials.export refuses its own auto"
+            "when both columns exist, so one is always chosen here explicitly."
+    .expert_level = 1
+  composition = CH
+    .type = str
+    .help = "Chemical composition of the asymmetric unit, written into the SHELX"
+            ".ins file that accompanies the exported intensities."
+    .expert_level = 2
+  phil = None
+    .type = path
+    .help = "Phil options file to use for the export. Parameters defined in the"
+            "xia2.laue_tof phil scope will take precedent over identical options"
+            "defined in the phil file."
+    .expert_level = 3
+}
+"""
+
 workflow_phil_str = """
 workflow {
-  steps = *bin *find_spots *index *refine *integrate
+  steps = *bin *find_spots *index *refine *integrate *combine *export
     .type = choice(multi=True)
     .help = "Option to turn off particular steps. Multiple choices should be of"
             "the format steps=find_spots+index"
@@ -334,6 +391,7 @@ full_phil_str = (
     + spotfinding_phil_str
     + indexing_phil_str
     + integration_phil_str
+    + output_phil_str
     + workflow_phil_str
 )
 
@@ -609,11 +667,14 @@ class IndexingParams:
 
 @dataclass
 class IntegrationParams:
-    method: str = "summation"
+    method: str = "profile_1d_ibix"
+    fallback_method: str = "summation"
+    min_profile_fraction: float = 0.5
     integration_type: str = "observed"
     calculated_d_min: float | None = None
     background_model: str = "linear3d"
-    mask: str = "ellipse"
+    mask: str = "both"
+    mask_metric: str = "i_over_sigma"
     ellipse_mask_scale: float = 1.0
     wavelength_range: tuple[float, float] | None = None
     bbox_tof_padding: int = 2
@@ -664,10 +725,13 @@ class IntegrationParams:
 
         return cls(
             integration.method,
+            integration.fallback_method,
+            integration.min_profile_fraction,
             integration.integration_type,
             integration.calculated_d_min,
             integration.background_model,
             integration.mask,
+            integration.mask_metric,
             integration.ellipse_mask_scale,
             wavelength_range,
             integration.bbox_tof_padding,
@@ -678,6 +742,23 @@ class IntegrationParams:
             absorption,
             params.multiprocessing.nproc,
             _resolved_file(integration.phil),
+        )
+
+
+@dataclass
+class ExportParams:
+    intensity: str = "auto"
+    min_profile_fraction: float = 0.5
+    composition: str = "CH"
+    phil: pathlib.Path | None = None
+
+    @classmethod
+    def from_phil(cls, params: iotbx.phil.scope_extract) -> ExportParams:
+        return cls(
+            params.output.intensity,
+            params.integration.min_profile_fraction,
+            params.output.composition,
+            _resolved_file(params.output.phil),
         )
 
 
@@ -700,6 +781,7 @@ class LaueTOFSetup:
     spotfinding_params: SpotfindingParams
     indexing_params: IndexingParams
     integration_params: IntegrationParams
+    export_params: ExportParams
     options: AlgorithmParams
     # Input file class, keyed on the image path, for files given with image=
     input_classes: dict[str, str] = field(default_factory=dict)
@@ -790,6 +872,20 @@ def _log_setup(setup: LaueTOFSetup) -> None:
         "TOF Lorentz correction will "
         + ("be applied during integration" if integration.lorentz else "not be applied")
     )
+    if integration.mask == "both":
+        xia2_logger.info(
+            "Integrating the first orientation with each foreground mask and"
+            f" keeping the better by {integration.mask_metric}"
+        )
+    xia2_logger.info(
+        f"Integration method: {integration.method}"
+        + (
+            ""
+            if integration.method == "summation"
+            or integration.fallback_method == "none"
+            else f", falling back to {integration.fallback_method} if it fails"
+        )
+    )
 
 
 def setup_from_phil(params: iotbx.phil.scope_extract) -> LaueTOFSetup:
@@ -804,6 +900,7 @@ def setup_from_phil(params: iotbx.phil.scope_extract) -> LaueTOFSetup:
         spotfinding_params=SpotfindingParams.from_phil(params),
         indexing_params=IndexingParams.from_phil(params),
         integration_params=IntegrationParams.from_phil(params, file_input),
+        export_params=ExportParams.from_phil(params),
         options=AlgorithmParams.from_phil(params),
         input_classes=_classify_file_input(file_input),
     )

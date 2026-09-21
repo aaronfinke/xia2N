@@ -162,7 +162,7 @@ the returned cell matches the input would catch this.
 
 ## Workaround
 
-Convert in the caller, which makes the missing conversion a no-op:
+Convert in the caller, so the skipped conversion has nothing left to do:
 
 ```python
 cb_op = crystal.get_space_group().info().change_of_basis_op_to_primitive_setting()
@@ -171,3 +171,10 @@ A = crystal.change_basis(cb_op).get_A()
 
 With that, the same seeded run returns `(105.846, 95.665, 113.918, 90, 98.039, 90)`
 and matches the reference orientation to 0.02°.
+
+Note that this workaround depends on the defect being present: the seed crystal
+is built as `Crystal(A_matrix, known_symmetry.space_group)`, so the change of
+basis computed in `find_lattices` is the non-identity centred→primitive op
+whatever matrix is supplied. Once the conversion is restored, a caller passing a
+primitive-setting matrix would have it converted a second time, so any such
+workaround has to be removed with the fix.

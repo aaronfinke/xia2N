@@ -8,7 +8,11 @@ import subprocess
 from dataclasses import dataclass, field
 
 from dials.array_family import flex
-from dxtbx.model import Crystal
+from dials.util.multi_dataset_handling import (
+    assign_unique_identifiers,
+    parse_multiple_datasets,
+)
+from dxtbx.model import Crystal, ExperimentList
 from dxtbx.serialize import load
 
 from xia2.Driver.timing import record_step
@@ -18,6 +22,7 @@ from xia2.Modules.Laue_TOF.laue_tof import (
     NXLAUETOF,
     NXSNSEVENT,
     BinningParams,
+    ExportParams,
     FileInput,
     IndexingParams,
     IntegrationParams,
@@ -30,6 +35,9 @@ xia2_logger = logging.getLogger(__name__)
 # Not a dials.index method: the label used when an orientation is supplied,
 # which routes dials.index into the known orientation indexer instead.
 KNOWN_ORIENTATION = "known_orientation"
+
+# Foreground/background mask methods, as named by dials.tof_integrate
+MASKS = ("ellipse", "seed_skewness")
 
 
 @dataclass
@@ -74,6 +82,21 @@ class ExposureResult:
     @property
     def indexed(self) -> bool:
         return self.indexing is not None and self.indexing.accepted
+
+
+@dataclass
+class IntegrationChoices:
+    """
+    Integration decisions taken on the first orientation and reused for the rest.
+
+    Every orientation of a run has to be integrated the same way for the
+    batches to be comparable when they are scaled together, and retrying a
+    method that has already failed once, or re-comparing the two masks on every
+    orientation, only costs time.
+    """
+
+    method: str | None = None
+    mask: str | None = None
 
 
 def _executable(name: str, override: pathlib.Path | None = None) -> str:
@@ -236,13 +259,17 @@ def find_spots(working_directory: pathlib.Path, params: SpotfindingParams) -> in
 
 def _primitive_setting_a_matrix(crystal: Crystal) -> tuple[float, ...]:
     """
-    The A matrix of a crystal, in the primitive setting.
+    The A matrix of a crystal, in the primitive setting. Needed currently
+    due to a DIALS bug.
 
-    dials.index expects known_symmetry.A_matrix in the primitive setting and is
-    meant to convert it itself, but the conversion in IndexerKnownOrientation is
-    assigned to the loop variable and discarded, so a centred cell is converted
-    to the centred setting twice and comes back wrong. Converting here makes the
-    missing conversion a no-op.
+    dials.index expects known_symmetry.A_matrix in the primitive setting and
+    contains the conversion, but IndexerKnownOrientation assigns it to the loop
+    variable and discards it (DIALS 3.30), while the post-indexing conversion
+    back to the centred setting still runs - so a centred cell comes back wrong.
+    Converting here supplies the setting the indexer needs, leaving the skipped
+    conversion nothing to do. Note this is tied to the defect: the crystal is
+    built with known_symmetry.space_group, so a fixed DIALS would convert this
+    matrix a second time. _assess_indexing's cell check is what would catch it.
     """
     cb_op = crystal.get_space_group().info().change_of_basis_op_to_primitive_setting()
     return crystal.change_basis(cb_op).get_A()
@@ -400,26 +427,31 @@ def refine(working_directory: pathlib.Path) -> None:
     )
 
 
-def integrate(
-    working_directory: pathlib.Path,
+def _tof_integrate_command(
     params: IntegrationParams,
-    experiments: str = "refined.expt",
-    reflections: str = "refined.refl",
-) -> pathlib.Path:
-    """Run dials.tof_integrate, returning the integrated reflection file."""
+    method: str,
+    mask: str,
+    tag: str,
+    experiments: str,
+    reflections: str,
+) -> list[str]:
+    """The dials.tof_integrate command line for one method/mask combination."""
     command = [
         _executable("dials.tof_integrate"),
         experiments,
         reflections,
-        f"method={params.method}",
+        f"method={method}",
+        f"mask={mask}",
         f"integration_type={params.integration_type}",
         f"background_model={params.background_model}",
-        f"mask={params.mask}",
         f"ellipse_mask.scale={params.ellipse_mask_scale}",
         f"bbox_tof_padding={params.bbox_tof_padding}",
         f"bbox_xy_padding={params.bbox_xy_padding}",
         f"corrections.lorentz={params.lorentz}",
         f"mp.nproc={params.nproc}",
+        f"output.experiments=integrated_{tag}.expt",
+        f"output.reflections=integrated_{tag}.refl",
+        f"output.log=tof_integrate_{tag}.log",
     ]
     if params.phil:
         command.insert(1, os.fspath(params.phil))
@@ -435,19 +467,335 @@ def integrate(
     if params.absorption:
         for name, value in params.absorption.items():
             command.append(f"corrections.absorption.target_spectrum.{name}={value}")
+    return command
+
+
+def _integration_quality(reflections: pathlib.Path) -> tuple[int, float]:
+    """
+    How well an integration run went: how many reflections were integrated by
+    summation, and their mean I/sigma.
+
+    Summation is used for the comparison whatever the method, because it is the
+    one set of intensities that every run produces.
+    """
+    table = flex.reflection_table.from_file(reflections)
+    table = table.select(table.get_flags(table.flags.integrated_sum))
+    if not table.size():
+        return 0, 0.0
+    variance = table["intensity.sum.variance"]
+    table = table.select(variance > 0)
+    if not table.size():
+        return 0, 0.0
+    i_over_sigma = table["intensity.sum.value"] / flex.sqrt(
+        table["intensity.sum.variance"]
+    )
+    return table.size(), float(flex.mean(i_over_sigma))
+
+
+def _profile_fraction(reflections: pathlib.Path) -> float:
+    """
+    The fraction of integrated reflections that a profile fit succeeded for.
+
+    A profile run can finish cleanly having fitted almost nothing, leaving an
+    intensity.prf column that covers a handful of reflections, so success of
+    the program is not success of the method.
+    """
+    table = flex.reflection_table.from_file(reflections)
+    if "intensity.prf.value" not in table:
+        return 0.0
+    n_summed = table.get_flags(table.flags.integrated_sum).count(True)
+    if not n_summed:
+        return 0.0
+    return table.get_flags(table.flags.integrated_prf).count(True) / n_summed
+
+
+def _run_tof_integrate(
+    working_directory: pathlib.Path,
+    params: IntegrationParams,
+    method: str,
+    mask: str,
+    experiments: str,
+    reflections: str,
+) -> tuple[str, pathlib.Path]:
+    """
+    Integrate with one mask, falling back to summation if a profile method
+    fails outright.
+
+    Profile fitting is not a per-reflection risk only: a single shoebox that
+    the fit cannot bound aborts dials.tof_integrate, so the whole run is lost.
+    Returns the method that actually produced the output.
+    """
+    tag = f"{method}_{mask}"
+    try:
+        _run_program(
+            _tof_integrate_command(params, method, mask, tag, experiments, reflections),
+            working_directory,
+            "dials.tof_integrate",
+        )
+    except ValueError as e:
+        fallback = params.fallback_method
+        if method == fallback or fallback == "none":
+            raise
+        xia2_logger.warning(
+            f"Integration with method={method} failed, falling back to"
+            f" {fallback}. The failure was:\n{str(e).strip().splitlines()[-1]}"
+        )
+        _record_log(
+            f"{working_directory.name} integrate ({tag}, failed)",
+            working_directory / f"tof_integrate_{tag}.log",
+        )
+        return _run_tof_integrate(
+            working_directory, params, fallback, mask, experiments, reflections
+        )
+
+    _record_log(
+        f"{working_directory.name} integrate ({tag})",
+        working_directory / f"tof_integrate_{tag}.log",
+    )
+    integrated = working_directory / f"integrated_{tag}.refl"
+    if not integrated.is_file():
+        raise ValueError(f"dials.tof_integrate did not write {integrated.name}")
+
+    if method != "summation":
+        fraction = _profile_fraction(integrated)
+        if fraction < params.min_profile_fraction:
+            # The summation intensities in this file are still good, so there
+            # is nothing to rerun - but say so, and stop paying for a profile
+            # fit that is not delivering on the orientations still to come.
+            xia2_logger.warning(
+                f"{method} fitted only {fraction:.1%} of the reflections, fewer"
+                f" than integration.min_profile_fraction"
+                f" ({params.min_profile_fraction:.0%}), so the summation"
+                " intensities will be used"
+            )
+            return "summation", integrated
+        xia2_logger.info(f"{method} fitted {fraction:.1%} of the reflections")
+    return method, integrated
+
+
+def _record_lorentz(reflections: pathlib.Path, applied: bool) -> None:
+    """
+    Record whether the Lorentz correction was applied, per reflection.
+
+    dials.tof_integrate applies the correction to the intensities themselves
+    and leaves no trace of it in the output beyond a line in its log, so the
+    file cannot be asked later whether it has been corrected. The Lorentz
+    factor must be applied exactly once, and the scaling programs downstream
+    have their own keyword for it, so carry the answer with the data.
+    """
+    table = flex.reflection_table.from_file(reflections)
+    table["lorentz_applied"] = flex.bool(table.size(), applied)
+    table.as_file(reflections)
+
+
+def integrate(
+    working_directory: pathlib.Path,
+    params: IntegrationParams,
+    choices: IntegrationChoices | None = None,
+    experiments: str = "refined.expt",
+    reflections: str = "refined.refl",
+) -> pathlib.Path:
+    """
+    Run dials.tof_integrate, returning the integrated reflection file.
+
+    With mask=both the data are integrated with each foreground mask and the
+    better of the two is kept; that choice, and any fallback from a failed
+    profile method, are recorded in choices and reused for the remaining
+    orientations, so that every batch is integrated the same way.
+    """
+    choices = choices if choices is not None else IntegrationChoices()
+    method = choices.method or params.method
+    if choices.mask:
+        masks = [choices.mask]
+    elif params.mask == "both":
+        masks = list(MASKS)
+    else:
+        masks = [params.mask]
 
     xia2_logger.notice(banner("Integrating"))  # type: ignore
-    _run_program(command, working_directory, "dials.tof_integrate")
-    _record_log(
-        f"{working_directory.name} integrate", working_directory / "tof_integrate.log"
-    )
+
+    integrated_files = {}
+    for mask in masks:
+        method, integrated = _run_tof_integrate(
+            working_directory, params, method, mask, experiments, reflections
+        )
+        integrated_files[mask] = integrated
+    choices.method = method
+
+    if len(integrated_files) > 1:
+        quality = {
+            mask: _integration_quality(f) for mask, f in integrated_files.items()
+        }
+        for mask, (n_integrated, i_over_sigma) in quality.items():
+            xia2_logger.info(
+                f"{mask}: {n_integrated} reflections integrated,"
+                f" <I/sigma> {i_over_sigma:.1f}"
+            )
+        index = 1 if params.mask_metric == "i_over_sigma" else 0
+        mask = max(quality, key=lambda m: quality[m][index])
+        xia2_logger.info(f"Keeping the {mask} mask, by {params.mask_metric}")
+    else:
+        mask = masks[0]
+    choices.mask = mask
 
     integrated = working_directory / "integrated.refl"
-    if not integrated.is_file():
-        raise ValueError("dials.tof_integrate did not write integrated.refl")
+    shutil.copyfile(integrated_files[mask], integrated)
+    shutil.copyfile(
+        integrated_files[mask].with_suffix(".expt"),
+        working_directory / "integrated.expt",
+    )
+    _record_lorentz(integrated, params.lorentz)
     FileHandler.record_data_file(str(working_directory / "integrated.expt"))
     FileHandler.record_data_file(str(integrated))
     return integrated
+
+
+def combine(
+    working_directory: pathlib.Path, results: list[ExposureResult]
+) -> tuple[pathlib.Path, pathlib.Path]:
+    """
+    Concatenate the integrated output of every orientation into one pair of
+    files, ready to export.
+
+    Each orientation keeps its own experiment identifier and its own batch, so
+    that the exported intensities can be scaled per setting downstream.
+    """
+    integrated = [result for result in results if result.integrated]
+    if not integrated:
+        raise ValueError(
+            "No orientation was integrated, so there is nothing to combine"
+        )
+    working_directory.mkdir(parents=True, exist_ok=True)
+    xia2_logger.notice(banner("Combining"))  # type: ignore
+
+    experiments = ExperimentList()
+    tables = []
+    # Which orientation each of the combined experiments came from
+    origins: list[str] = []
+    for result in integrated:
+        expts = load.experiment_list(
+            result.directory / "integrated.expt", check_format=False
+        )
+        table = flex.reflection_table.from_file(result.directory / "integrated.refl")
+        split = parse_multiple_datasets([table])
+        experiments.extend(expts)
+        tables.extend(split)
+        origins.extend([result.name] * len(split))
+    experiments, tables = assign_unique_identifiers(experiments, tables)
+
+    # dials.export numbers the Laue batches by imageset_id, which is zero in
+    # every per-orientation file. Renumber it to the position of the experiment
+    # in the combined list, which is also where its imageset now sits, so that
+    # each orientation exports as its own batch.
+    for i, (table, origin) in enumerate(zip(tables, origins)):
+        table["imageset_id"] = flex.int(table.size(), i)
+        xia2_logger.info(f"Batch {i}: {origin}, {table.size()} reflections")
+
+    if len(tables) > 1:
+        combined = flex.reflection_table.concat(tables)
+    else:
+        combined = tables[0]
+    _report_lorentz(combined)
+
+    experiments_file = working_directory / "combined.expt"
+    reflections_file = working_directory / "combined.refl"
+    experiments.as_file(experiments_file)
+    combined.as_file(reflections_file)
+    xia2_logger.info(
+        f"Combined {len(experiments)} experiment(s), {combined.size()} reflections,"
+        f" into {experiments_file.name} and {reflections_file.name}"
+    )
+    FileHandler.record_data_file(str(experiments_file))
+    FileHandler.record_data_file(str(reflections_file))
+    return experiments_file, reflections_file
+
+
+def _intensity_choice(reflections: pathlib.Path, params: ExportParams) -> str:
+    """
+    Which intensities to export.
+
+    dials.export refuses its own auto choice for SHELX when both summation and
+    profile-fitted intensities are present, which is exactly what a successful
+    profile run produces, so the choice is always made here.
+    """
+    if params.intensity != "auto":
+        return params.intensity
+    fraction = _profile_fraction(reflections)
+    if fraction >= params.min_profile_fraction:
+        return "profile"
+    if fraction:
+        xia2_logger.info(
+            f"Profile-fitted intensities cover only {fraction:.1%} of the"
+            " reflections, so the summation intensities are exported"
+        )
+    return "sum"
+
+
+def _report_lorentz(table: flex.reflection_table) -> None:
+    """
+    Say whether the combined data carry the Lorentz correction.
+
+    The correction has to be applied exactly once, here or by the scaling
+    program, so the answer decides what is passed downstream. Orientations that
+    disagree cannot be scaled together.
+    """
+    if "lorentz_applied" not in table:
+        xia2_logger.warning(
+            "The combined data do not record whether the Lorentz correction was"
+            " applied. It must be applied exactly once - check before scaling."
+        )
+        return
+    applied = set(table["lorentz_applied"])
+    if len(applied) > 1:
+        raise ValueError(
+            "Some orientations were integrated with the Lorentz correction and"
+            " some without, so they cannot be scaled together. Reintegrate them"
+            " the same way (integration.lorentz)."
+        )
+    if applied.pop():
+        xia2_logger.info(
+            "The Lorentz correction was applied during integration, so it must"
+            " not be applied again when scaling."
+        )
+    else:
+        xia2_logger.info(
+            "The Lorentz correction was not applied during integration, so it"
+            " must be applied when scaling."
+        )
+
+
+def export_shelx(
+    working_directory: pathlib.Path,
+    params: ExportParams,
+    experiments: str = "combined.expt",
+    reflections: str = "combined.refl",
+) -> pathlib.Path:
+    """Run dials.export format=shelx, returning the exported hkl file."""
+    intensity = _intensity_choice(working_directory / reflections, params)
+    command = [
+        _executable("dials.export"),
+        experiments,
+        reflections,
+        "format=shelx",
+        f"intensity={intensity}",
+        f"shelx.composition={params.composition}",
+    ]
+    if params.phil:
+        command.insert(1, os.fspath(params.phil))
+
+    xia2_logger.notice(banner("Exporting"))  # type: ignore
+    _run_program(command, working_directory, "dials.export")
+    _record_log("export", working_directory / "dials.export.log")
+
+    hklout = working_directory / "dials.hkl"
+    if not hklout.is_file():
+        raise ValueError("dials.export did not write dials.hkl")
+    xia2_logger.info(f"Exported the {intensity} intensities to {hklout.name}")
+    FileHandler.record_data_file(str(hklout))
+    ins = working_directory / "dials.ins"
+    if ins.is_file():
+        FileHandler.record_data_file(str(ins))
+    return hklout
 
 
 def _prepare_images(
@@ -526,6 +874,7 @@ def process_exposure(
     setup: LaueTOFSetup,
     seed_crystal: Crystal | None = None,
     path_type: str = "image",
+    choices: IntegrationChoices | None = None,
 ) -> ExposureResult:
     """
     Process one crystal orientation: bin, import, find spots, index, refine
@@ -556,7 +905,7 @@ def process_exposure(
         return result
 
     if integrate_image == index_image:
-        integrate(working_directory, setup.integration_params)
+        integrate(working_directory, setup.integration_params, choices)
         result.integrated = True
         return result
 
@@ -589,7 +938,7 @@ def process_exposure(
         )
         return result
 
-    integrate(integrate_directory, setup.integration_params)
+    integrate(integrate_directory, setup.integration_params, choices)
     result.integrated = True
     result.directory = integrate_directory
     return result
@@ -630,11 +979,12 @@ def run_data_integration(
 
     results: list[ExposureResult] = []
     seed_crystal: Crystal | None = None
+    choices = IntegrationChoices()
 
     for i, (path_type, image) in enumerate(inputs, start=1):
         working_directory = root_working_directory / f"orientation_{i}"
         result = process_exposure(
-            working_directory, image, setup, seed_crystal, path_type
+            working_directory, image, setup, seed_crystal, path_type, choices
         )
         results.append(result)
         if (
@@ -656,8 +1006,22 @@ def run_data_integration(
                 setup,
                 seed_crystal,
                 inputs[i][0],
+                choices,
             )
             results[i] = retried
 
     _report(results)
+
+    if "combine" not in setup.options.steps:
+        return results
+    if not any(result.integrated for result in results):
+        xia2_logger.warning(
+            "No orientation was integrated, so there is nothing to combine or export"
+        )
+        return results
+
+    scale_directory = root_working_directory / "scale"
+    combine(scale_directory, results)
+    if "export" in setup.options.steps:
+        export_shelx(scale_directory, setup.export_params)
     return results

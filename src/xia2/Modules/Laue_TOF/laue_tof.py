@@ -406,10 +406,107 @@ output {
 }
 """
 
+scaling_phil_str = """
+scaling {
+  pointless {
+    executable = None
+      .type = path
+      .help = "Path to pointless. Defaults to $CCP4/bin/pointless, then $PATH."
+              "The build must be newer than 1.13.6: older ones drop the"
+              "wavelength column, which makes LAUE fatal in lawless."
+      .expert_level = 1
+    lauegroup = None
+      .type = str
+      .help = "Laue group passed to pointless. Defaults to the one implied by"
+              "the space group. Symmetry determination on unnormalised Laue data"
+              "is unreliable - the wavelength dependence inflates the"
+              "disagreement between symmetry mates - so the group is always"
+              "given rather than left to pointless."
+      .expert_level = 1
+    space_group = None
+      .type = space_group
+      .help = "Space group passed to pointless as CHOOSE SPACEGROUP. Defaults to"
+              "the space group used for indexing."
+      .expert_level = 1
+    keywords = None
+      .type = str
+      .multiple = True
+      .help = "Extra pointless keyword lines, appended after the generated ones."
+      .expert_level = 2
+  }
+  lawless {
+    executable = None
+      .type = path
+      .help = "Path to lawless (the Laue branch of aimless). Defaults to"
+              "'lawless' then 'aimless' on $PATH."
+      .expert_level = 1
+    probe = *neutron xray
+      .type = choice
+      .expert_level = 2
+    normalisation = *gpr chebyshev none
+      .type = choice
+      .help = "How the incident spectrum is modelled: a Gaussian process"
+              "(NORMGPR), a Chebyshev polynomial (NORMCHEBYSHEV) or not at all."
+      .expert_level = 1
+    lam_min = None
+      .type = float
+      .help = "Wavelength range the normalisation curve covers. Defaults to the"
+              "range of the data."
+      .expert_level = 2
+    lam_max = None
+      .type = float
+      .expert_level = 2
+    lam_ref = None
+      .type = float
+      .help = "Reference wavelength the curve is normalised to (NORMLAMREF)."
+              "Defaults to the middle of the range."
+      .expert_level = 2
+    chebyshev_degree = 6
+      .type = int
+      .expert_level = 2
+    gpr_bins = None
+      .type = int
+      .help = "Training bins for the Gaussian process (NORMGPRBINS). Too many"
+              "gives a curve with structure finer than the physics justifies."
+      .expert_level = 2
+    scales = "BATCH BFACTOR ON SECONDARY 0"
+      .type = str
+      .help = "The scale model, as the SCALES keyword takes it. One scale and"
+              "one B factor per batch, which with a handful of stationary"
+              "exposures may already be over-parameterised."
+      .expert_level = 1
+    sdcorrection = "NOREFINE 1.0 0.0 0.0"
+      .type = str
+      .help = "SDCORRECTION keyword. The default leaves the sigmas alone, so"
+              "that I/sigma stays comparable with the unscaled data."
+      .expert_level = 2
+    anomalous = False
+      .type = bool
+      .expert_level = 2
+    resolution = None
+      .type = floats(size=2)
+      .help = "Resolution range to scale over. The cutoff is a merging"
+              "decision, so it belongs here rather than at integration."
+      .expert_level = 1
+    lambda_only = False
+      .type = bool
+      .help = "Run the LAMBDAONLY diagnostic, which fits the wavelength curve"
+              "and stops."
+      .expert_level = 2
+    keywords = None
+      .type = str
+      .multiple = True
+      .help = "Extra lawless keyword lines, appended after the generated ones,"
+              "so that they win."
+      .expert_level = 2
+  }
+}
+"""
+
 workflow_phil_str = """
 workflow {
   steps = *bin *find_spots *index *refine *integrate *combine *export \
-          *unmerged_mtz
+          *unmerged_mtz *pointless *lawless
     .type = choice(multi=True)
     .help = "Option to turn off particular steps. Multiple choices should be of"
             "the format steps=find_spots+index"
@@ -424,6 +521,7 @@ full_phil_str = (
     + indexing_phil_str
     + integration_phil_str
     + output_phil_str
+    + scaling_phil_str
     + workflow_phil_str
 )
 
@@ -801,6 +899,77 @@ class ExportParams:
 
 
 @dataclass
+class PointlessParams:
+    executable: pathlib.Path | None = None
+    lauegroup: str | None = None
+    space_group: sgtbx.space_group | None = None
+    keywords: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_phil(cls, params: iotbx.phil.scope_extract) -> PointlessParams:
+        pointless = params.scaling.pointless
+        space_group = pointless.space_group or params.space_group
+        lauegroup = pointless.lauegroup
+        if lauegroup is None and space_group:
+            group = (
+                space_group.group() if hasattr(space_group, "group") else space_group
+            )
+            lauegroup = (
+                sgtbx.space_group_info(
+                    group=group.build_derived_reflection_intensity_group(
+                        anomalous_flag=False
+                    )
+                )
+                .type()
+                .lookup_symbol()
+            )
+        return cls(
+            _resolved_file(pointless.executable),
+            lauegroup,
+            space_group,
+            [line for line in pointless.keywords if line],
+        )
+
+
+@dataclass
+class LawlessParams:
+    executable: pathlib.Path | None = None
+    probe: str = "neutron"
+    normalisation: str = "gpr"
+    lam_min: float | None = None
+    lam_max: float | None = None
+    lam_ref: float | None = None
+    chebyshev_degree: int = 6
+    gpr_bins: int | None = None
+    scales: str = "BATCH BFACTOR ON SECONDARY 0"
+    sdcorrection: str = "NOREFINE 1.0 0.0 0.0"
+    anomalous: bool = False
+    resolution: tuple[float, float] | None = None
+    lambda_only: bool = False
+    keywords: list[str] = field(default_factory=list)
+
+    @classmethod
+    def from_phil(cls, params: iotbx.phil.scope_extract) -> LawlessParams:
+        lawless = params.scaling.lawless
+        return cls(
+            _resolved_file(lawless.executable),
+            lawless.probe,
+            lawless.normalisation,
+            lawless.lam_min,
+            lawless.lam_max,
+            lawless.lam_ref,
+            lawless.chebyshev_degree,
+            lawless.gpr_bins,
+            lawless.scales,
+            lawless.sdcorrection,
+            lawless.anomalous,
+            tuple(lawless.resolution) if lawless.resolution else None,
+            lawless.lambda_only,
+            [line for line in lawless.keywords if line],
+        )
+
+
+@dataclass
 class AlgorithmParams:
     steps: list[str] = field(default_factory=list)
     nproc: int = 1
@@ -820,6 +989,8 @@ class LaueTOFSetup:
     indexing_params: IndexingParams
     integration_params: IntegrationParams
     export_params: ExportParams
+    pointless_params: PointlessParams
+    lawless_params: LawlessParams
     options: AlgorithmParams
     # Input file class, keyed on the image path, for files given with image=
     input_classes: dict[str, str] = field(default_factory=dict)
@@ -939,6 +1110,8 @@ def setup_from_phil(params: iotbx.phil.scope_extract) -> LaueTOFSetup:
         indexing_params=IndexingParams.from_phil(params),
         integration_params=IntegrationParams.from_phil(params, file_input),
         export_params=ExportParams.from_phil(params),
+        pointless_params=PointlessParams.from_phil(params),
+        lawless_params=LawlessParams.from_phil(params),
         options=AlgorithmParams.from_phil(params),
         input_classes=_classify_file_input(file_input),
     )

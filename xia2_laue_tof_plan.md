@@ -28,11 +28,43 @@ orientation** (1359 + 1344 reflections in batches 0 and 1).
 
 **Next, in order:**
 
-1. pointless and lawless (§ *Step 8/9*). The unmerged MTZ converter is written.
+1. The output report (§ *The output report*): reuse `xia2.Modules.Report` on
+   lawless's `scaled_unmerged.mtz`, plus a Laue section for the wavelength
+   normalisation.
 2. Integrate everything the geometry allows, not only the observed spots
    (§ *Resolution: observed, then calculated*).
 3. Finish `tests/regression/test_laue_tof.py` (SXD, the converter unit test),
    then the docs.
+
+**The scaling tail is written** (2026-09-21): `laue_tof_scale.py`, wired in as
+the `pointless` and `lawless` workflow steps, with the `scaling{}` phil scope.
+Verified end to end on the two-orientation NMX data - 2703 observations →
+`sorted.mtz` → `scaled.mtz` + `scaled_unmerged.mtz`, with GPR normalisation
+(reference 2.883 Å over 2.229-3.537 Å, squared-exponential kernel, length scale
+0.158, 49 training bins). The statistics are meaningless on that dataset, since
+it is the same exposure twice, but they parse and report.
+
+Things learned doing it:
+
+- **pointless is chosen by version, not by path.** CCP4 9 ships 1.13.6, which
+  drops the wavelength column; the local build is 1.16.1. Every candidate on
+  `$PATH` and in `$CCP4/bin` is asked its version (`POINTLESS version x.y.z` in
+  the banner), the first one newer than 1.13.6 wins, and a run that can only
+  find an old one stops with a message naming the version it found. The
+  wavelength column is still checked afterwards as a backstop.
+- **Both programs need absolute HKLIN paths.** lawless writes LAMBDANORM,
+  SCALES, ROGUES and the plot files into its working directory, so it is given
+  one of its own, and a relative HKLIN then resolves against the wrong place.
+  Worse, lawless reports that as *"LAUE requires a wavelength for every
+  observation, but HKLIN has no wavelength column"* - the file it could not open
+  has no columns at all - so a `Cannot open file` in the output is now caught
+  directly.
+- **lawless 0.0.1 writes invalid XML**: the document opens `<LAWLESS>` and closes
+  `</AIMLESS>`, left over from the rename, so every strict parser refuses it.
+  The reader repairs that one mismatch. Worth fixing in lawless.
+- Statistics live in `Result/Dataset/<name>/{Overall,Inner,Outer}`, not in an
+  `Overall` block, and the fitted curve in `WavelengthNormalisationGPR` or
+  `WavelengthNormalisationChebyshev`.
 
 **`laue_tof_mtz.py` is written** (2026-09-21) and wired in as the `unmerged_mtz`
 workflow step, writing `scale/unmerged.mtz` from the combined data with gemmi:
@@ -680,6 +712,40 @@ lorentz.applied_by = *integrate | lawless | none
 Whichever is chosen, log the decision explicitly. Expect the overall R-merge to
 move a lot when the correction is on (re-weighting of resolution shells), while
 per-shell values stay put — that is not a loss of quality.
+
+## The output report
+
+xia2 already has this, and the Laue-TOF pipeline should use the same thing
+rather than grow its own: `xia2.Modules.Report.Report` +
+`src/xia2/templates/report.html`, driven as `xia2.cli.report` drives it -
+`Report.from_unmerged_mtz(mtz, params, report_dir)`, then
+`resolution_plots_and_stats()`, `batch_dependent_plots()`,
+`intensity_stats_plots()`, `multiplicity_plots()`, rendered with jinja2 into
+`<prefix>-report.html` and `<prefix>-report.json`. That is the format
+`xia2.report`, multiplex and `xia2.html` all produce, so a Laue user gets the
+tables and plots they already know: CC½ and I/sigma against resolution,
+completeness, multiplicity, Rmerge against batch, second moments, the L test,
+Wilson plot and the multiplicity images.
+
+Fit for this pipeline:
+
+- **Input**: `Report.from_unmerged_mtz` wants an unmerged MTZ with `BATCH` and
+  `I`/`SIGI`, which is exactly what lawless writes as
+  `scaled_unmerged.mtz` - so the report goes at the end of the scaling tail, on
+  the scaled data, and one batch per orientation makes the batch plots a
+  per-setting summary. It also reads `SCALEUSED` when present, which lawless
+  writes; nothing must apply it a second time.
+- **Call it in process**, as `xia2.cli.report.run` does, rather than shelling
+  out, so that the report lands in the run directory and is registered with
+  `FileHandler.record_html_file` like every other xia2 html output.
+- **What it will not show** is the Laue-specific part: the wavelength
+  normalisation curve, the per-batch wavelength band, and `I`/`SIGI` against
+  `IPR`/`SIGIPR`. lawless writes `LAMBDANORM` and `NORMPLOT` for the first of
+  those, and its XML carries the fitted parameters
+  (`WavelengthNormalisationGPR`: reference wavelength, range, kernel, length
+  scale, training bins), so the pipeline should add one section of its own to
+  the same page instead of a separate report.
+- `prefix` should be `xia2.laue_tof`, giving `xia2.laue_tof-report.html`.
 
 ## Resolution: observed now, calculated next
 

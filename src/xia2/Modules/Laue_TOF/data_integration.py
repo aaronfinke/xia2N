@@ -1093,6 +1093,21 @@ def _match_intensity_columns(
                 del table[column]
 
 
+def _lorentz_applied(reflections_file: pathlib.Path) -> bool:
+    """
+    Whether the data already carries the Lorentz correction.
+
+    This is what decides whether the scaling program is asked to apply it: it
+    belongs in the data exactly once. Without the column the safer answer is
+    that it was applied, since that is what this pipeline does by default, and
+    the combine step has already warned about the missing provenance.
+    """
+    table = flex.reflection_table.from_file(reflections_file)
+    if "lorentz_applied" not in table:
+        return True
+    return bool(set(table["lorentz_applied"]).pop())
+
+
 def _report_lorentz(table: flex.reflection_table) -> None:
     """
     Say whether the combined data carry the Lorentz correction.
@@ -1421,6 +1436,19 @@ def run_data_integration(
     experiments_file, reflections_file = combine(scale_directory, results)
     if "export" in setup.options.steps:
         export_shelx(scale_directory, setup.export_params)
-    if "unmerged_mtz" in setup.options.steps:
-        unmerged_mtz(scale_directory, experiments_file, reflections_file)
+    if "unmerged_mtz" not in setup.options.steps:
+        return results
+    mtz_file = unmerged_mtz(scale_directory, experiments_file, reflections_file)
+
+    if "pointless" in setup.options.steps or "lawless" in setup.options.steps:
+        from xia2.Modules.Laue_TOF.laue_tof_scale import scale
+
+        scale(
+            scale_directory,
+            mtz_file,
+            setup.pointless_params,
+            setup.lawless_params,
+            _lorentz_applied(reflections_file),
+            setup.options.steps,
+        )
     return results

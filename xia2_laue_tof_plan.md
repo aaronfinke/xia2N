@@ -95,6 +95,104 @@ orientation** (1359 + 1344 reflections in batches 0 and 1).
   resolves symlinks, so two links to one file end up as one input path (but still
   two entries, hence two orientations). Worth knowing when constructing tests.
 
+**MANDI (ORNL) test case, added 2026-09-21** — `tests/regression/test_laue_tof.py`:
+
+- Data: `MANDI_13378.nxs.h5` (CuZnSOD, IPTS-37773), 3.2 GB of raw events,
+  copied off `/Volumes/Finke_NMX/Mandi/CuZnSOD/` into **`work/mandi/`**, which
+  is gitignored (`/work` in `.gitignore`). Too big for `dials_data`, so the
+  tests skip unless a copy is there or `XIA2_LAUE_TOF_MANDI` points at one.
+  The known cell, from the user's own lawless work on this dataset, is
+  **`P 65 2 2`, `65.73 65.73 151.88 90 90 120`**.
+- **MANDI is binned in place, not by essnmx** (user, 2026-09-21): dxtbx writes
+  the histogram into the event file itself - bin edges in
+  `entry/time_of_flight`, counts in `entry/<bank>_events/spectra` - which is
+  what `FormatMANDI` reads, and **the event data is kept**
+  (`remove_event_data=False`). `FormatMANDI` has no reader for a separately
+  reduced file yet; when it gets one, this goes back through `essmandi-reduce`.
+  `binning.essmandi_reduce` was removed and a generic `binning.tof_padding`
+  (100 us, the dxtbx default) added. **No instrument geometry is repeated in
+  xia2**: the panel size comes from `FormatMANDI._get_image_size()`, which can
+  be asked before the histogram exists, since the format instantiates on a raw
+  event file. `histogram_mandi_run` skips the work if the file already carries a
+  histogram, and one binning per file means `binning.integrate_bins` does not
+  apply (warned about, `index_bins` wins).
+- **Verified end to end on `MANDI_13378.nxs.h5`**: 50 bins of 337.4 us over
+  14639-31507 us written into the event file (which grew 3.220 -> 3.274 GB, the
+  events kept), then `dials.import` read it with **FormatMANDI, 40 panels, 50
+  TOF bins**, and spotfinding found **227 strong spots**; 10 m 35 s, almost all
+  of it the histogram. It did not index - not pursued yet; 227 spots off 40
+  panels is few, so `spotfinding.min_spot_size` (15, tuned for NMX) and the bin
+  count are the first things to try. With the histogram cached both tests run
+  in 10 s.
+- **Spotfinding and indexing parameters on MANDI** (all with the known cell,
+  `indexing.max_cell` from it, `d_min_start=4`):
+
+  | spot list | strong | fft3d | real_space_grid_search | fft1d |
+  |---|---|---|---|---|
+  | `min_spot_size=15` (NMX default) | 227 | fails | 147 (65 %) | 159 (70 %) |
+  | `min_spot_size=3` | 370 | 205 (55 %) | 227 (61 %) | 238 (64 %) |
+  | `min_spot_size=3` + `radial_profile` | 603 | 236 (39 %) | 282 (47 %) | 284 (47 %) |
+
+  Every solution refines to the right cell (65.7-66.2, 151.9-152.9 against the
+  known 65.73, 151.88). `min_spot_size=15` is **too big for this data**: of 558
+  spots found, 331 are smaller than 15 pixels, so it throws away 59 % of them,
+  and MANDI spots span few TOF frames at 337 us bins. It still indexes, just off
+  a third of the spots. `sigma_strong` makes almost no difference (366 spots at
+  2.0 against 370 at 3.0); `radial_profile` finds the most.
+  The phil default stays 15, which is what the NMX study chose - say if it
+  should change - but the step now **says so**: it reports how much of the spot
+  list the size filter took and, when that is over half and there is room to
+  lower it, suggests `min_spot_size` and `radial_profile`.
+- **Two bugs in the indexing acceptance test, both found here**:
+  1. `min_indexed` was an absolute 250, so every good MANDI solution (147-284
+     indexed) was rejected and the orientation counted as "not indexed". It is
+     now a floor of 50 plus `min_indexed_fraction` (0.25 of the strong spots),
+     which travels between datasets: 65 % of 227 passes, while 300 of 2300 NMX
+     spots no longer would.
+  2. There was **no test on the residuals**, so the first method to index enough
+     reflections won. On MANDI that took fft3d at 3.31 px over
+     real_space_grid_search at 3.25 px, and with `radial_profile` it accepted
+     fft3d at **6.10 px**. Now `max_rmsd_px` (5.0) rejects a bad fit outright,
+     `target_rmsd_px` (2.0) stops the ladder when a solution is good enough,
+     and otherwise every method is tried and the **best by RMSD is kept** -
+     each attempt writes `indexed_<method>.{expt,refl}` and the chosen one is
+     copied to `indexed.{expt,refl}`.
+     Note this RMSD is over every indexed reflection, so it reads higher than
+     the `RMSD_X`/`RMSD_Y` in the dials.index log, which are post-outlier
+     rejection: MANDI is 3.25 px here where dials.index reports 1.5/1.6 px.
+  Verified: MANDI `min_spot_size=3` now walks fft3d (3.31) ->
+  real_space_grid_search (3.25) -> fft1d (5.42, rejected) and keeps
+  real_space_grid_search, 51 s. NMX is unchanged - fft3d 1927/2296 (83.9 %),
+  RMSD 1.52 px, accepted at once, 26 s.
+- **Two things in `FormatMANDI` had to be worked around**, both worth reporting:
+  1. `get_time_range_for_panel` returns `event_time_zero + event_time_offset`,
+     i.e. **seconds since the start of the run plus microseconds since the
+     pulse**. For this 23 h run it gives 14700-113000 where every event
+     actually arrives between 14739 and 31407 us, so histogramming over that
+     range would silently pile every event into the first few bins. It is also
+     a Python loop over all 4.8 M pulses of all 44 banks, minutes of work.
+     `_mandi_tof_range` takes min/max of `event_time_offset` instead - the
+     quantity `generate_histogram_data_for_panel` actually histograms - in
+     seconds, or uses `binning.min_time_bin`/`max_time_bin` when given.
+  2. `add_histogram_data_to_nxs_file` derives its bins from that range with a
+     `delta_tof` bin *width*. The step calls `write_histogram_data` with
+     explicit edges instead, so the bin *count* is the one asked for and the
+     event data is not scanned twice.
+
+  A third thing, not worked around: `generate_histogram_data_for_panel` builds a
+  pool task per pixel (65536 of them) and hands each one the panel's whole event
+  arrays, so a panel takes about a minute and a 40 panel run about 40 minutes.
+  The same histogram is a few seconds of `np.bincount` on
+  `pixel_index * nbins + bin_index`. Worth replacing, in dxtbx or here.
+- `run_import` names the format class in its errors and logs panels/TOF bins on
+  success: a reduced NMX file and a reduced MANDI file are both NXlauetof, and
+  an instrument-specific class that claims the wrong one fails deep in dxtbx.
+  (Seen with the essnmx route: `ess/nmx/nexus.py::_set_default_instrument`
+  writes `entry/instrument/name = "NMX"` unconditionally, so a MANDI reduction
+  is claimed by `FormatESSNMX`, whose `get_detector` does
+  `i = int(panel_name[-1])` into a three-entry NMX dict and raises
+  `KeyError: 2`. Fix that in essnmx before returning to that route.)
+
 **Not started**: everything in *Wavelength normalisation and scaling*, which was
 deliberately deferred — the module deals only with binning and the DIALS steps.
 

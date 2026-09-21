@@ -44,3 +44,6 @@ _*.nb
 .git-notifier*
 git-notifier.log
 .gitversion
+
+# Local test data and scratch work (large files, never committed)
+/work

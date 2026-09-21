@@ -7,6 +7,8 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 
+import h5py
+import numpy
 from dials.array_family import flex
 from dials.util.multi_dataset_handling import (
     assign_unique_identifiers,
@@ -151,10 +153,7 @@ def bin_run(
         xia2_logger.info(f"Using existing reduction {output_file}")
         return output_file
 
-    if file_class == NXSNSEVENT:
-        program = _executable("essmandi-reduce", params.essmandi_reduce)
-    else:
-        program = _executable("essnmx-reduce", params.essnmx_reduce)
+    program = _executable("essnmx-reduce", params.essnmx_reduce)
     name = pathlib.Path(program).name
 
     command = [
@@ -184,6 +183,152 @@ def bin_run(
     return output_file
 
 
+def _format_class_name(image: str) -> str:
+    """
+    The dxtbx format class that will read a file, for error messages.
+
+    Which class claims a file matters here: a reduced MANDI file and a reduced
+    NMX file are both NXlauetof, and an instrument-specific class that claims
+    the wrong one of them fails deep inside dxtbx, where the traceback says
+    nothing about why.
+    """
+    try:
+        from dxtbx.format.Registry import get_format_class_for_file
+
+        format_class = get_format_class_for_file(image)
+    except Exception:
+        return "unknown"
+    return format_class.__name__ if format_class else "none"
+
+
+def _mandi_histogram_bins(image: pathlib.Path) -> int | None:
+    """
+    The number of TOF bins already histogrammed into a MANDI event file, if any.
+
+    FormatMANDI reads the histogram from the event file itself: bin edges in
+    entry/time_of_flight, counts in entry/<bank>_events/spectra.
+    """
+    with h5py.File(image, "r") as fh:
+        entry = fh[next(iter(fh.keys()))]
+        if "time_of_flight" not in entry:
+            return None
+        spectra = [
+            name
+            for name in entry
+            if name.endswith("_events") and "spectra" in entry[name]
+        ]
+        if not spectra:
+            return None
+        return len(entry["time_of_flight"]) - 1
+
+
+def _mandi_tof_range(image: pathlib.Path, params: BinningParams) -> tuple[float, float]:
+    """
+    The time-of-flight range to histogram a MANDI run over, in microseconds.
+
+    Taken from binning.min_time_bin/max_time_bin when both are given, and
+    otherwise from the event_time_offset of every panel, which is the quantity
+    that dxtbx histograms (microseconds since the pulse).
+
+    Not from FormatMANDI.get_time_range_for_dataset: that adds event_time_zero
+    (seconds since the start of the run) to event_time_offset (microseconds
+    since the pulse), so for a run of any length it returns a range far wider
+    than any time of flight - 14700-113000 for a 23 hour MANDI run whose events
+    all arrive between 14700 and 31500 us. Histogramming over that range puts
+    every event in the first few bins, silently. It is also a Python loop over
+    every pulse of every panel, which takes minutes.
+    """
+    if params.min_time_bin is not None and params.max_time_bin is not None:
+        scale = {"ms": 1000.0, "us": 1.0, "ns": 0.001}[params.time_bin_unit]
+        return params.min_time_bin * scale, params.max_time_bin * scale
+
+    with record_step("event time-of-flight range"), h5py.File(image, "r") as fh:
+        entry = fh[next(iter(fh.keys()))]
+        limits = []
+        for name in entry:
+            if not name.endswith("_events") or "event_time_offset" not in entry[name]:
+                continue
+            offsets = entry[name]["event_time_offset"]
+            if not offsets.size:
+                continue
+            values = offsets[...]
+            limits.append((float(values.min()), float(values.max())))
+    if not limits:
+        raise ValueError(
+            f"No event_time_offset data was found in {image}, so its"
+            " time-of-flight range cannot be determined. Give"
+            " binning.min_time_bin and binning.max_time_bin."
+        )
+    min_tof = min(low for low, _ in limits)
+    max_tof = max(high for _, high in limits)
+    xia2_logger.info(
+        f"Events in {len(limits)} panels arrive between {min_tof:.0f} and"
+        f" {max_tof:.0f} us"
+    )
+    return min_tof, max_tof
+
+
+def histogram_mandi_run(
+    image: str, nbins: int, params: BinningParams, nproc: int
+) -> pathlib.Path:
+    """
+    Histogram a raw MANDI run into TOF bins, in the event file itself.
+
+    This is what FormatMANDI reads: it has no reader for a separately reduced
+    file yet, so dxtbx writes the histogram into the event file alongside the
+    events (which are kept) and dials.import then reads that same file. Nothing
+    is written if the file already carries a histogram.
+    """
+    from dxtbx.format.FormatMANDI import FormatMANDI
+
+    path = pathlib.Path(image)
+    existing = _mandi_histogram_bins(path)
+    if existing is not None:
+        xia2_logger.info(
+            f"Using the {existing} TOF bin histogram already in {path.name}."
+            " Delete entry/time_of_flight and the per-panel spectra datasets to"
+            " histogram it again."
+        )
+        return path
+
+    xia2_logger.notice(banner(f"Histogramming into {nbins} TOF bins"))  # type: ignore
+    # The reader owns the instrument geometry, so ask it for the panel size
+    # rather than repeating the detector dimensions here.
+    panel_size = FormatMANDI(os.fspath(path))._get_image_size()
+    padding = params.tof_padding
+    min_tof, max_tof = _mandi_tof_range(path, params)
+    tof_bins = numpy.linspace(min_tof - padding, max_tof + padding, nbins + 1)
+
+    xia2_logger.info(
+        f"Panels are {panel_size[0]} x {panel_size[1]} pixels, per FormatMANDI"
+    )
+    xia2_logger.info(
+        f"MANDI data is histogrammed in place: {nbins} bins of"
+        f" {(tof_bins[-1] - tof_bins[0]) / nbins:.1f} us over"
+        f" {tof_bins[0]:.0f}-{tof_bins[-1]:.0f} us are written into {path},"
+        " keeping the event data."
+    )
+    # This is what FormatMANDI.add_histogram_data_to_nxs_file does, less its
+    # generate_tof_bins call: the bin edges are given here instead, so that the
+    # bin count is the one asked for, and so that the event data is not scanned
+    # for its time range a second time.
+    with record_step("FormatMANDI.write_histogram_data"):
+        FormatMANDI.write_histogram_data(
+            nxs_file_path=os.fspath(path),
+            tof_bins=tof_bins,
+            panel_size=panel_size,
+            remove_event_data=False,
+            write_tof_bins=True,
+            nproc=nproc,
+        )
+
+    written = _mandi_histogram_bins(path)
+    if written is None:
+        raise ValueError(f"No histogram was written into {path}")
+    xia2_logger.info(f"Wrote a {written} TOF bin histogram into {path.name}")
+    return path
+
+
 def run_import(
     working_directory: pathlib.Path,
     image: str,
@@ -203,7 +348,13 @@ def run_import(
         command.append(f"mask={os.fspath(file_input.mask)}")
 
     xia2_logger.notice(banner("Importing"))  # type: ignore
-    _run_program(command, working_directory, "dials.import")
+    try:
+        _run_program(command, working_directory, "dials.import")
+    except ValueError as e:
+        raise ValueError(
+            f"dials.import failed on {image}, which dxtbx reads with"
+            f" {_format_class_name(image)}.\n{e}"
+        ) from e
     _record_log(
         f"{working_directory.name} import", working_directory / "dials.import.log"
     )
@@ -211,11 +362,55 @@ def run_import(
     expts = load.experiment_list(experiments, check_format=False)
     if not expts.all_tof():
         raise ValueError(
-            f"{image} was not imported as time-of-flight data. Check that the"
-            " file holds TOF bins, and that it is being read by the expected"
-            " format class (see dials.show imported.expt)."
+            f"{image} was not imported as time-of-flight data. It was read with"
+            f" {_format_class_name(image)}; check that the file holds TOF bins,"
+            " and that the expected format class is reading it."
         )
+    xia2_logger.info(
+        f"Imported {len(expts)} experiment(s) with {_format_class_name(image)},"
+        f" {len(expts[0].detector)} panels, {expts[0].scan.get_num_images()} TOF bins"
+    )
     return experiments
+
+
+def _report_size_filter(logfile: pathlib.Path, params: SpotfindingParams) -> None:
+    """
+    Say how much of the spot list the minimum spot size took, when it is a lot.
+
+    min_spot_size is the parameter most worth revisiting on a new instrument:
+    the default suits NMX, where small split peaks are the problem, but on data
+    whose spots span few TOF frames it can discard most of what was found. The
+    counts are in the dials.find_spots log, which reports what it extracted
+    before filtering.
+    """
+    if not logfile.is_file():
+        return
+    extracted = removed = 0
+    for line in logfile.read_text().splitlines():
+        if line.startswith("Extracted ") and line.endswith(" spots"):
+            extracted = int(line.split()[1])
+        elif line.startswith("Removed ") and " with size < " in line:
+            removed = int(line.split()[1])
+    if not extracted or not removed:
+        return
+    fraction = removed / extracted
+    message = (
+        f"{removed} of {extracted} spots found were smaller than"
+        f" spotfinding.min_spot_size ({params.min_spot_size} pixels)"
+    )
+    if fraction >= 0.5 and params.min_spot_size > 3:
+        # Nothing to suggest once the size filter is down to a few pixels: a
+        # threshold algorithm like radial_profile finds tens of thousands of
+        # one and two pixel candidates by design, and dropping those is the
+        # filter working rather than a loss.
+        xia2_logger.warning(
+            f"{message}. That is most of them: try a smaller"
+            " spotfinding.min_spot_size, and"
+            " spotfinding.threshold_algorithm=radial_profile, if indexing"
+            " struggles for want of spots."
+        )
+    else:
+        xia2_logger.info(message)
 
 
 def find_spots(working_directory: pathlib.Path, params: SpotfindingParams) -> int:
@@ -247,6 +442,7 @@ def find_spots(working_directory: pathlib.Path, params: SpotfindingParams) -> in
     strong = flex.reflection_table.from_file(working_directory / "strong.refl")
     n_strong = strong.size()
     xia2_logger.info(f"Found {n_strong} strong spots")
+    _report_size_filter(working_directory / "dials.find_spots.log", params)
     if n_strong > params.max_strong:
         raise ValueError(
             f"{n_strong} strong spots found, more than spotfinding.max_strong"
@@ -287,8 +483,8 @@ def _assess_indexing(
     the positional residuals.
     """
     result = IndexingResult(method=method, n_strong=n_strong)
-    experiments = working_directory / "indexed.expt"
-    reflections = working_directory / "indexed.refl"
+    experiments = working_directory / f"indexed_{method}.expt"
+    reflections = working_directory / f"indexed_{method}.refl"
     if not (experiments.is_file() and reflections.is_file()):
         result.reason = "no solution found"
         return result
@@ -299,6 +495,10 @@ def _assess_indexing(
     result.n_indexed = indexed.size()
 
     if "xyzcal.px" in indexed and indexed.size():
+        # Over every indexed reflection, outliers included, so this runs higher
+        # than the RMSD_X/RMSD_Y that dials.index reports after refinement has
+        # rejected outliers. Compare it with other values from here, not with
+        # the numbers in the dials.index log.
         dx, dy, _ = (indexed["xyzobs.px.value"] - indexed["xyzcal.px"]).parts()
         result.rmsd_px = float(flex.mean(dx * dx + dy * dy) ** 0.5)
 
@@ -308,10 +508,24 @@ def _assess_indexing(
     crystal = expts.crystals()[0]
     result.crystal = crystal
 
-    if result.n_indexed < params.min_indexed:
+    required = max(params.min_indexed, int(params.min_indexed_fraction * n_strong))
+    if result.n_indexed < required:
         result.reason = (
-            f"only {result.n_indexed} reflections indexed, fewer than"
-            f" indexing.min_indexed ({params.min_indexed})"
+            f"only {result.n_indexed} of {n_strong} strong spots indexed"
+            f" ({result.fraction_indexed:.1%}), fewer than the {required}"
+            f" required by indexing.min_indexed ({params.min_indexed}) and"
+            f" indexing.min_indexed_fraction ({params.min_indexed_fraction:.0%})"
+        )
+        return result
+
+    if (
+        params.max_rmsd_px
+        and result.rmsd_px is not None
+        and result.rmsd_px > params.max_rmsd_px
+    ):
+        result.reason = (
+            f"RMSD {result.rmsd_px:.2f} px is worse than"
+            f" indexing.max_rmsd_px ({params.max_rmsd_px})"
         )
         return result
 
@@ -390,7 +604,11 @@ def index(
 
     attempts = []
     for method in methods:
-        command = base_command + [f"output.log=dials.index.{method}.log"]
+        command = base_command + [
+            f"output.log=dials.index.{method}.log",
+            f"output.experiments=indexed_{method}.expt",
+            f"output.reflections=indexed_{method}.refl",
+        ]
         if method != KNOWN_ORIENTATION:
             command.append(f"indexing.method={method}")
         try:
@@ -408,9 +626,31 @@ def index(
         )
         xia2_logger.info(result.summary())
         attempts.append(result)
-        if result.accepted:
+        if result.accepted and (
+            result.rmsd_px is None
+            or params.target_rmsd_px is None
+            or result.rmsd_px <= params.target_rmsd_px
+        ):
+            # Good enough that trying the rest of the ladder would only cost time
             break
-    return attempts
+
+    accepted = [attempt for attempt in attempts if attempt.accepted]
+    if not accepted:
+        return attempts
+
+    # The methods do not rank in a fixed order - which one fits a given
+    # orientation best is what the ladder is for - so take the best of those
+    # that passed rather than the first, and put its files where the following
+    # steps expect them.
+    chosen = min(accepted, key=lambda a: (a.rmsd_px is None, a.rmsd_px))
+    if len(accepted) > 1:
+        xia2_logger.info(f"Keeping the {chosen.method} solution, by RMSD")
+    for suffix in ("expt", "refl"):
+        shutil.copyfile(
+            working_directory / f"indexed_{chosen.method}.{suffix}",
+            working_directory / f"indexed.{suffix}",
+        )
+    return [attempt for attempt in attempts if attempt is not chosen] + [chosen]
 
 
 def refine(working_directory: pathlib.Path) -> None:
@@ -814,6 +1054,20 @@ def _prepare_images(
     binning = setup.binning_params
     if "bin" not in setup.options.steps or image not in setup.files_to_bin:
         return image, image
+    if file_class == NXSNSEVENT:
+        # MANDI: one histogram, written into the event file itself, so the file
+        # to index and the file to integrate are both the input file.
+        if not binning.single_reduction:
+            xia2_logger.warning(
+                "MANDI data is histogrammed in place, which allows one binning"
+                f" per file, so binning.index_bins ({binning.index_bins}) is"
+                f" used and binning.integrate_bins ({binning.integrate_bins})"
+                " is ignored."
+            )
+        histogrammed = os.fspath(
+            histogram_mandi_run(image, binning.index_bins, binning, setup.options.nproc)
+        )
+        return histogrammed, histogrammed
     index_image = os.fspath(
         bin_run(working_directory, image, file_class, binning.index_bins, binning)
     )

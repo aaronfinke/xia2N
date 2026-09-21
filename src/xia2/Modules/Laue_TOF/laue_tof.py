@@ -130,11 +130,14 @@ binning {
     .help = "Path to the essnmx-reduce executable, used for NMX data."
             "Defaults to looking it up on $PATH."
     .expert_level = 3
-  essmandi_reduce = None
-    .type = path
-    .help = "Path to the essmandi-reduce executable, used for MANDI data."
-            "Defaults to looking it up on $PATH."
-    .expert_level = 3
+  tof_padding = 100
+    .type = float
+    .help = "Padding (microseconds) added to each end of the time-of-flight"
+            "range when histogramming event data in place, as dxtbx does for"
+            "MANDI. This is the dxtbx default. The detector geometry that goes"
+            "with it, panel size included, is read from the format class, not"
+            "set here."
+    .expert_level = 2
   extra_args = None
     .type = str
     .multiple = True
@@ -210,10 +213,38 @@ indexing {
     .type = int
     .help = "Only attempt to index an exposure with at least this many strong spots."
     .expert_level = 2
-  min_indexed = 250
+  min_indexed = 50
     .type = int
     .help = "Reject an indexing solution with fewer than this many indexed"
-            "reflections, and move on to the next method in the ladder."
+            "reflections, and move on to the next method in the ladder. This is"
+            "a floor: min_indexed_fraction of the strong spots is used when that"
+            "is the larger number."
+    .expert_level = 2
+  min_indexed_fraction = 0.25
+    .type = float(value_min=0, value_max=1)
+    .help = "Reject an indexing solution that indexes a smaller fraction of the"
+            "strong spots than this. A fraction travels between datasets in a"
+            "way an absolute count does not: a good MANDI solution indexes 65%"
+            "of 227 spots, which an absolute cut of 250 would have thrown away,"
+            "while a bad solution on 2300 NMX spots can index 300 of them."
+    .expert_level = 2
+  max_rmsd_px = 5.0
+    .type = float
+    .help = "Reject an indexing solution whose positional RMSD is worse than"
+            "this, in pixels. Indexing plenty of reflections on a cell of the"
+            "right size is not enough: fft3d has been seen to take 39% of a"
+            "MANDI spot list at 6.1 px where another method fitted the same data"
+            "at 3.2 px. Note this RMSD covers every indexed reflection, so it"
+            "runs higher than the RMSD_X/RMSD_Y dials.index reports after"
+            "outlier rejection. None turns the test off."
+    .expert_level = 2
+  target_rmsd_px = 2.0
+    .type = float
+    .help = "An accepted solution this good stops the ladder. Otherwise every"
+            "method in the ladder is tried and the best by RMSD is kept, since"
+            "the first method to give an acceptable answer is not necessarily"
+            "the one that fits best. None makes the first acceptable solution"
+            "win, as before."
     .expert_level = 2
   seed_from_first = True
     .type = bool
@@ -547,8 +578,8 @@ class BinningParams:
     max_time_bin: float | None = None
     time_bin_unit: str = "us"
     detector_ids: list[int] | None = None
+    tof_padding: float = 100.0
     essnmx_reduce: pathlib.Path | None = None
-    essmandi_reduce: pathlib.Path | None = None
     extra_args: list[str] = field(default_factory=list)
 
     @property
@@ -567,8 +598,8 @@ class BinningParams:
             binning.max_time_bin,
             binning.time_bin_unit,
             list(binning.detector_ids) if binning.detector_ids else None,
+            binning.tof_padding,
             _resolved_file(binning.essnmx_reduce),
-            _resolved_file(binning.essmandi_reduce),
             [arg for arg in binning.extra_args if arg],
         )
 
@@ -606,7 +637,10 @@ class IndexingParams:
     max_cell: float | None = None
     d_min_start: float | None = 4.0
     min_spots: int = 10
-    min_indexed: int = 250
+    min_indexed: int = 50
+    min_indexed_fraction: float = 0.25
+    max_rmsd_px: float | None = 5.0
+    target_rmsd_px: float | None = 2.0
     seed_from_first: bool = True
     outlier_algorithm: str = "mcd"
     outlier_iqr_multiplier: float = 0.8
@@ -657,6 +691,9 @@ class IndexingParams:
             indexing.d_min_start,
             indexing.min_spots,
             indexing.min_indexed,
+            indexing.min_indexed_fraction,
+            indexing.max_rmsd_px,
+            indexing.target_rmsd_px,
             indexing.seed_from_first,
             indexing.outlier.algorithm,
             indexing.outlier.iqr_multiplier,
